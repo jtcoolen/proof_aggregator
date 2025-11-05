@@ -129,7 +129,7 @@ fn configure_ivc_circuit(
     // We still configure two instance columns for compatibility with the chips,
     // but we will NOT use the committed one at proving time (it will be empty).
     let committed_instance_column = meta.instance_column(); // column 0 (unused/empty)
-    let instance_column = meta.instance_column();           // column 1 (plain)
+    let instance_column = meta.instance_column(); // column 1 (plain)
 
     let native_config = NativeChip::configure(
         meta,
@@ -208,11 +208,24 @@ impl Circuit<F> for IvcCircuit {
             *self_vk_value,
         )?;
 
-        // Witness left and right states and add them to get the new state.
+        // Witness left and right states and compute the new state.
+        // Change: "genesis" (both child states == 0) yields next_state = 1.
+        // Otherwise, next_state = left_state + right_state.
         // Constrain the new state as a PUBLIC INPUT (PLAIN instance column).
         let left_state = scalar_chip.assign(&mut layouter, self.left_state)?;
         let right_state = scalar_chip.assign(&mut layouter, self.right_state)?;
-        let next_state = scalar_chip.add(&mut layouter, &left_state, &right_state)?;
+
+        // Bits indicating whether each child is zero.
+        let is_left_zero = scalar_chip.is_zero(&mut layouter, &left_state)?;
+        let is_right_zero = scalar_chip.is_zero(&mut layouter, &right_state)?;
+        // "Genesis" bit: both zero -> 1, else 0 (use multiplication for AND on {0,1} bits)
+        let is_genesis = scalar_chip.and(
+            &mut layouter,
+            &[is_left_zero.clone(), is_right_zero.clone()],
+        )?;
+        // next_state = left + right + is_genesis
+        let tmp_sum = scalar_chip.add(&mut layouter, &left_state, &right_state)?;
+        let next_state = scalar_chip.add(&mut layouter, &tmp_sum, &is_genesis.into())?;
         scalar_chip.constrain_as_public_input(&mut layouter, &next_state)?;
 
         // Fixed "committed instance" base used by the verifier (identity point).
@@ -257,9 +270,8 @@ impl Circuit<F> for IvcCircuit {
             self.left_proof.clone(),
         )?;
 
-        // Genesis gating for left child
-        let is_left_genesis = scalar_chip.is_zero(&mut layouter, &left_state)?;
-        let is_not_left_genesis = scalar_chip.not(&mut layouter, &is_left_genesis)?;
+        // Genesis gating for left child (now uses the precomputed zero-bit)
+        let is_not_left_genesis = scalar_chip.not(&mut layouter, &is_left_zero)?;
         AssignedAccumulator::scale_by_bit(
             &mut layouter,
             &scalar_chip,
@@ -297,9 +309,8 @@ impl Circuit<F> for IvcCircuit {
             self.right_proof.clone(),
         )?;
 
-        // Genesis gating for right child
-        let is_right_genesis = scalar_chip.is_zero(&mut layouter, &right_state)?;
-        let is_not_right_genesis = scalar_chip.not(&mut layouter, &is_right_genesis)?;
+        // Genesis gating for right child (uses the precomputed zero-bit)
+        let is_not_right_genesis = scalar_chip.not(&mut layouter, &is_right_zero)?;
         AssignedAccumulator::scale_by_bit(
             &mut layouter,
             &scalar_chip,
@@ -387,14 +398,16 @@ fn main() {
         ),
     );
 
-    // Create leaf nodes (genesis nodes). With left=0, right=0, the circuit's next_state = 0.
+    // Create leaf nodes (genesis nodes). With left=0 and right=0,
+    // the circuit now forces next_state = 1 (genesis bias).
     let num_leaves = 4; // Create a tree with 4 leaves (can be adjusted)
     let mut current_level: Vec<TreeNode> = vec![];
 
     println!("Creating {} leaf nodes...", num_leaves);
     for i in 0..num_leaves {
-        // For genesis leaves both child states are zero so both proofs are skipped.
-        let state = F::ZERO;
+        // For genesis leaves both child states are zero so both child proofs are skipped in-circuit.
+        // But the leaf's own state is 1.
+        let state = F::ONE;
 
         let circuit = IvcCircuit {
             self_vk: (
@@ -406,7 +419,7 @@ fn main() {
             right_state: Value::known(F::ZERO),
             left_proof: Value::known(vec![]),
             right_proof: Value::known(vec![]),
-            left_acc: Value::known(trivial_acc.clone()),  // child's PI acc (leaf)
+            left_acc: Value::known(trivial_acc.clone()), // child's PI acc (leaf)
             right_acc: Value::known(trivial_acc.clone()), // child's PI acc (leaf)
         };
 
@@ -440,8 +453,7 @@ fn main() {
         println!("Leaf {i} proof created in {:?}", start.elapsed());
 
         // proof_acc for THIS node (what the parent will use as `left/right_proof_acc`)
-        let proof_acc =
-            verify_and_extract_acc(&srs, &vk, &fixed_bases, &proof, &public_inputs);
+        let proof_acc = verify_and_extract_acc(&srs, &vk, &fixed_bases, &proof, &public_inputs);
 
         // pi_acc for THIS node (what the parent will witness as `left/right_acc`)
         let pi_acc = trivial_acc.clone();
@@ -470,6 +482,7 @@ fn main() {
             let left = &current_level[i];
             let right = &current_level[i + 1];
 
+            // For internal nodes, next_state = left.state + right.state (no +1).
             let state = left.state + right.state;
 
             // Parent circuit must witness each child's PI accumulator (not their proof_acc).
@@ -488,10 +501,16 @@ fn main() {
             };
 
             // Apply the SAME genesis gating as in-circuit:
-            let left_proof_component =
-                if left.state == F::ZERO { zero_acc() } else { left.proof_acc.clone() };
-            let right_proof_component =
-                if right.state == F::ZERO { zero_acc() } else { right.proof_acc.clone() };
+            let left_proof_component = if left.state == F::ZERO {
+                zero_acc()
+            } else {
+                left.proof_acc.clone()
+            };
+            let right_proof_component = if right.state == F::ZERO {
+                zero_acc()
+            } else {
+                right.proof_acc.clone()
+            };
 
             // Compute the parent PI accumulator EXACTLY as in-circuit order:
             // accumulate([left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc])
@@ -537,8 +556,7 @@ fn main() {
             );
 
             // proof_acc for THIS node (what the *next* level will use as child proof_acc)
-            let proof_acc =
-                verify_and_extract_acc(&srs, &vk, &fixed_bases, &proof, &public_inputs);
+            let proof_acc = verify_and_extract_acc(&srs, &vk, &fixed_bases, &proof, &public_inputs);
 
             // pi_acc for THIS node (what the *next* level will witness as child acc)
             let pi_acc = accumulated_pi;
@@ -560,12 +578,13 @@ fn main() {
     println!("\n=== Tree Construction Complete ===");
     println!("Root state: {:?}", root.state);
 
-    // With the current leaf construction (left=0, right=0), each leaf state is 0.
-    // So the expected root state is also 0.
+    // With the current leaf construction (left=0, right=0, genesis bias +1),
+    // each leaf state is 1. For a binary tree that sums child states at internal
+    // nodes, the expected root state is the number of leaves.
     println!(
         "Expected root state (sum of {} leaves): {:?}",
         num_leaves,
-        F::ZERO
+        F::from(num_leaves as u64)
     );
 }
 
