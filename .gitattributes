@@ -1,0 +1,2 @@
+*.bin filter=lfs diff=lfs merge=lfs -text
+bls_filecoin_2p20 filter=lfs diff=lfs merge=lfs -text
