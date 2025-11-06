@@ -3,7 +3,6 @@
 // and a driver that builds a binary aggregation tree. It addresses the compile
 // errors you reported (wrong VK/PK types, missing SRS type, bit/cell mismatches)
 // and removes use of committed instances (mirroring the IVC example).
-
 use halo2curves::{ff::Field, group::Group};
 use midnight_circuits::hash::poseidon::PoseidonState;
 use midnight_circuits::types::AssignedForeignPoint;
@@ -42,12 +41,18 @@ use midnight_proofs::{
     transcript::{CircuitTranscript, Transcript},
 };
 use rand::rngs::OsRng;
+use rayon::iter::IntoParallelIterator;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::Path;
 use std::time::Instant;
+
+// ==== Added only to run leaves and each level in parallel (no other logic changes) ====
+use rayon::prelude::*;
+use std::sync::Arc;
+// =====================================================================================
 
 // Reuse your type aliases
 type S = BlstrsEmulation;
@@ -370,6 +375,7 @@ fn main() {
         right_acc: Value::unknown(),
     };
 
+    // SRS / VK / PK generation (sequential as before)
     let srs = filecoin_srs(self_k);
 
     let start = Instant::now();
@@ -383,6 +389,12 @@ fn main() {
         "self_vk", &vk,
     ));
     let fixed_base_names = fixed_bases.keys().cloned().collect::<Vec<_>>();
+
+    // Wrap shared, read-only data with Arc so we can use it safely from threads.
+    let srs = Arc::new(srs);
+    let vk = Arc::new(vk);
+    let pk = Arc::new(pk);
+    let fixed_bases = Arc::new(fixed_bases);
 
     // This trivial accumulator must have a single base and scalar of F::ONE, and
     // the base has to be the default point of C.
@@ -401,131 +413,34 @@ fn main() {
     // Create leaf nodes (genesis nodes). With left=0 and right=0,
     // the circuit now forces next_state = 1 (genesis bias).
     let num_leaves = 4; // Create a tree with 4 leaves (can be adjusted)
-    let mut current_level: Vec<TreeNode> = vec![];
 
     println!("Creating {} leaf nodes...", num_leaves);
-    for i in 0..num_leaves {
-        // For genesis leaves both child states are zero so both child proofs are skipped in-circuit.
-        // But the leaf's own state is 1.
-        let state = F::ONE;
 
-        let circuit = IvcCircuit {
-            self_vk: (
-                self_domain.clone(),
-                self_cs.clone(),
-                Value::known(vk.transcript_repr()),
-            ),
-            left_state: Value::known(F::ZERO),
-            right_state: Value::known(F::ZERO),
-            left_proof: Value::known(vec![]),
-            right_proof: Value::known(vec![]),
-            left_acc: Value::known(trivial_acc.clone()), // child's PI acc (leaf)
-            right_acc: Value::known(trivial_acc.clone()), // child's PI acc (leaf)
-        };
+    // ===== Parallel leaf creation =====
+    let mut current_level: Vec<TreeNode> = (0..num_leaves)
+        .into_par_iter()
+        .map(|i| {
+            let state = F::ONE;
 
-        // === Single plain-column public inputs: [ VK || state || accumulator ] ===
-        // For a leaf, the PI accumulator is the trivial one.
-        let mut public_inputs = AssignedVk::<S>::as_public_input(&vk); // VK (now plain)
-        public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
-        public_inputs.extend(AssignedAccumulator::as_public_input(&trivial_acc));
-
-        let start = Instant::now();
-        let proof = {
-            let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
-            create_proof::<
-                F,
-                KZGCommitmentScheme<E>,
-                CircuitTranscript<PoseidonState<F>>,
-                IvcCircuit,
-            >(
-                &srs,
-                &pk,
-                &[circuit.clone()],
-                1,
-                // Pass [ empty committed , plain public inputs ]
-                &[&[&[], &public_inputs]],
-                OsRng,
-                &mut transcript,
-            )
-            .unwrap_or_else(|_| panic!("Problem creating leaf {i} proof"));
-            transcript.finalize()
-        };
-        println!("Leaf {i} proof created in {:?}", start.elapsed());
-
-        // proof_acc for THIS node (what the parent will use as `left/right_proof_acc`)
-        let proof_acc = verify_and_extract_acc(&srs, &vk, &fixed_bases, &proof, &public_inputs);
-
-        // pi_acc for THIS node (what the parent will witness as `left/right_acc`)
-        let pi_acc = trivial_acc.clone();
-
-        current_level.push(TreeNode {
-            state,
-            proof,
-            proof_acc,
-            pi_acc,
-        });
-    }
-
-    // Build the tree level by level
-    let mut level = 0;
-    while current_level.len() > 1 {
-        level += 1;
-        println!(
-            "\nBuilding level {} with {} nodes...",
-            level,
-            current_level.len() / 2
-        );
-
-        let mut next_level = vec![];
-
-        for i in (0..current_level.len()).step_by(2) {
-            let left = &current_level[i];
-            let right = &current_level[i + 1];
-
-            // For internal nodes, next_state = left.state + right.state (no +1).
-            let state = left.state + right.state;
-
-            // Parent circuit must witness each child's PI accumulator (not their proof_acc).
             let circuit = IvcCircuit {
                 self_vk: (
                     self_domain.clone(),
                     self_cs.clone(),
                     Value::known(vk.transcript_repr()),
                 ),
-                left_state: Value::known(left.state),
-                right_state: Value::known(right.state),
-                left_proof: Value::known(left.proof.clone()),
-                right_proof: Value::known(right.proof.clone()),
-                left_acc: Value::known(left.pi_acc.clone()),
-                right_acc: Value::known(right.pi_acc.clone()),
+                left_state: Value::known(F::ZERO),
+                right_state: Value::known(F::ZERO),
+                left_proof: Value::known(vec![]),
+                right_proof: Value::known(vec![]),
+                left_acc: Value::known(trivial_acc.clone()), // child's PI acc (leaf)
+                right_acc: Value::known(trivial_acc.clone()), // child's PI acc (leaf)
             };
 
-            // Apply the SAME genesis gating as in-circuit:
-            let left_proof_component = if left.state == F::ZERO {
-                zero_acc()
-            } else {
-                left.proof_acc.clone()
-            };
-            let right_proof_component = if right.state == F::ZERO {
-                zero_acc()
-            } else {
-                right.proof_acc.clone()
-            };
-
-            // Compute the parent PI accumulator EXACTLY as in-circuit order:
-            // accumulate([left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc])
-            let mut accumulated_pi = Accumulator::accumulate(&[
-                left_proof_component,
-                left.pi_acc.clone(),
-                right_proof_component,
-                right.pi_acc.clone(),
-            ]);
-            accumulated_pi.collapse();
-
-            // === Single plain-column public inputs for internal node ===
+            // === Single plain-column public inputs: [ VK || state || accumulator ] ===
+            // For a leaf, the PI accumulator is the trivial one.
             let mut public_inputs = AssignedVk::<S>::as_public_input(&vk);
             public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
-            public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
+            public_inputs.extend(AssignedAccumulator::as_public_input(&trivial_acc));
 
             let start = Instant::now();
             let proof = {
@@ -540,36 +455,141 @@ fn main() {
                     &pk,
                     &[circuit.clone()],
                     1,
-                    // [ empty committed , plain public inputs ]
+                    // Pass [ empty committed , plain public inputs ]
                     &[&[&[], &public_inputs]],
                     OsRng,
                     &mut transcript,
                 )
-                .unwrap_or_else(|_| panic!("Problem creating level {level} node {}", i / 2));
+                .unwrap_or_else(|_| panic!("Problem creating leaf {i} proof"));
                 transcript.finalize()
             };
-            println!(
-                "Level {} node {} proof created in {:?}",
-                level,
-                i / 2,
-                start.elapsed()
-            );
+            println!("Leaf {i} proof created in {:?}", start.elapsed());
 
-            // proof_acc for THIS node (what the *next* level will use as child proof_acc)
+            // proof_acc for THIS node (what the parent will use as `left/right_proof_acc`)
             let proof_acc = verify_and_extract_acc(&srs, &vk, &fixed_bases, &proof, &public_inputs);
 
-            // pi_acc for THIS node (what the *next* level will witness as child acc)
-            let pi_acc = accumulated_pi;
+            // pi_acc for THIS node (what the parent will witness as `left/right_acc`)
+            let pi_acc = trivial_acc.clone();
 
-            println!("Asserted validity of state {:?}", state);
-
-            next_level.push(TreeNode {
+            TreeNode {
                 state,
                 proof,
                 proof_acc,
                 pi_acc,
-            });
-        }
+            }
+        })
+        .collect();
+
+    // Build the tree level by level
+    let mut level = 0;
+    while current_level.len() > 1 {
+        level += 1;
+        println!(
+            "\nBuilding level {} with {} nodes...",
+            level,
+            current_level.len() / 2
+        );
+
+        // ===== Parallel internal-node proving per level =====
+        let pair_count = current_level.len() / 2;
+
+        let next_level: Vec<TreeNode> = (0..pair_count)
+            .into_par_iter()
+            .map(|pair_idx| {
+                let i = pair_idx * 2;
+                let left = current_level[i].clone();
+                let right = current_level[i + 1].clone();
+
+                // For internal nodes, next_state = left.state + right.state (no +1).
+                let state = left.state + right.state;
+
+                // Parent circuit must witness each child's PI accumulator (not their proof_acc).
+                let circuit = IvcCircuit {
+                    self_vk: (
+                        self_domain.clone(),
+                        self_cs.clone(),
+                        Value::known(vk.transcript_repr()),
+                    ),
+                    left_state: Value::known(left.state),
+                    right_state: Value::known(right.state),
+                    left_proof: Value::known(left.proof.clone()),
+                    right_proof: Value::known(right.proof.clone()),
+                    left_acc: Value::known(left.pi_acc.clone()),
+                    right_acc: Value::known(right.pi_acc.clone()),
+                };
+
+                // Apply the SAME genesis gating as in-circuit:
+                let left_proof_component = if left.state == F::ZERO {
+                    zero_acc()
+                } else {
+                    left.proof_acc.clone()
+                };
+                let right_proof_component = if right.state == F::ZERO {
+                    zero_acc()
+                } else {
+                    right.proof_acc.clone()
+                };
+
+                // Compute the parent PI accumulator EXACTLY as in-circuit order:
+                // accumulate([left_proof_acc, left_pi_acc, right_proof_acc, right_pi_acc])
+                let mut accumulated_pi = Accumulator::accumulate(&[
+                    left_proof_component,
+                    left.pi_acc.clone(),
+                    right_proof_component,
+                    right.pi_acc.clone(),
+                ]);
+                accumulated_pi.collapse();
+
+                // === Single plain-column public inputs for internal node ===
+                let mut public_inputs = AssignedVk::<S>::as_public_input(&vk);
+                public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
+                public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
+
+                let start = Instant::now();
+                let proof = {
+                    let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
+                    create_proof::<
+                        F,
+                        KZGCommitmentScheme<E>,
+                        CircuitTranscript<PoseidonState<F>>,
+                        IvcCircuit,
+                    >(
+                        &srs,
+                        &pk,
+                        &[circuit.clone()],
+                        1,
+                        // [ empty committed , plain public inputs ]
+                        &[&[&[], &public_inputs]],
+                        OsRng,
+                        &mut transcript,
+                    )
+                    .unwrap_or_else(|_| panic!("Problem creating level {level} node {}", pair_idx));
+                    transcript.finalize()
+                };
+                println!(
+                    "Level {} node {} proof created in {:?}",
+                    level,
+                    pair_idx,
+                    start.elapsed()
+                );
+
+                // proof_acc for THIS node (what the *next* level will use as child proof_acc)
+                let proof_acc =
+                    verify_and_extract_acc(&srs, &vk, &fixed_bases, &proof, &public_inputs);
+
+                // pi_acc for THIS node (what the *next* level will witness as child acc)
+                let pi_acc = accumulated_pi;
+
+                println!("Asserted validity of state {:?}", state);
+
+                TreeNode {
+                    state,
+                    proof,
+                    proof_acc,
+                    pi_acc,
+                }
+            })
+            .collect();
 
         current_level = next_level;
     }
