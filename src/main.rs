@@ -151,6 +151,14 @@ pub struct AggCircuit {
     right_proof: Value<Vec<u8>>,
     left_acc: Value<Accumulator<S>>,
     right_acc: Value<Accumulator<S>>,
+
+    // Per-prefix fixed-base sizes (sourced from actual VK CS)
+    fb_agg_fixsel: usize,
+    fb_agg_perm: usize,
+    fb_leaf_fixsel: usize,
+    fb_leaf_perm: usize,
+    fb_pose_fixsel: usize,
+    fb_pose_perm: usize,
 }
 
 fn configure_agg_circuit(
@@ -261,11 +269,25 @@ impl Circuit<F> for AggCircuit {
         let id_point: AssignedForeignPoint<F, C, _> =
             curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
-        let mut fixed_base_names = vec![String::from("com_instance")];
+        // Per-prefix union of fixed-base names — include "~G" (present in accumulators)
+        let mut fixed_base_names = vec![
+            String::from("com_instance"),
+            String::from("~G"),
+        ];
         fixed_base_names.extend(verifier::fixed_base_names::<S>(
-            vk_name,
-            vk_cs.num_fixed_columns() + vk_cs.num_selectors(),
-            vk_cs.permutation().columns.len(),
+            "agg_vk",
+            self.fb_agg_fixsel,
+            self.fb_agg_perm,
+        ));
+        fixed_base_names.extend(verifier::fixed_base_names::<S>(
+            "leaf_agg_vk",
+            self.fb_leaf_fixsel,
+            self.fb_leaf_perm,
+        ));
+        fixed_base_names.extend(verifier::fixed_base_names::<S>(
+            "poseidon_vk",
+            self.fb_pose_fixsel,
+            self.fb_pose_perm,
         ));
 
         // Left child
@@ -367,7 +389,7 @@ fn fixed_base_names_for(
     vk_name: &str,
     cs: &midnight_proofs::plonk::ConstraintSystem<F>,
 ) -> Vec<String> {
-    let mut names = vec![String::from("com_instance")];
+    let mut names = vec![String::from("com_instance"), String::from("~G")];
     names.extend(midnight_circuits::verifier::fixed_base_names::<S>(
         vk_name,
         cs.num_fixed_columns() + cs.num_selectors(),
@@ -410,12 +432,19 @@ fn main() {
         poseidon_halo2_vk,
     ));
 
-    // Setup AGG circuit
+    // Setup AGG circuit (CS only, used to derive shapes for keygen)
     let agg_k = K;
     let mut agg_cs = ConstraintSystem::default();
     configure_agg_circuit(&mut agg_cs);
     let agg_domain = EvaluationDomain::new(agg_cs.degree() as u32, agg_k);
 
+    // Pre-keygen sizes (used only to get VKs)
+    let agg_fixsel_pre = agg_cs.num_fixed_columns() + agg_cs.num_selectors();
+    let agg_perm_pre = agg_cs.permutation().columns.len();
+    let pose_fixsel = poseidon_vk_data.1.num_fixed_columns() + poseidon_vk_data.1.num_selectors();
+    let pose_perm = poseidon_vk_data.1.permutation().columns.len();
+
+    // Default AGG circuit for keygen (unknown witnesses)
     let default_agg_circuit = AggCircuit {
         agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
         poseidon_vk: None,
@@ -425,6 +454,12 @@ fn main() {
         right_proof: Value::unknown(),
         left_acc: Value::unknown(),
         right_acc: Value::unknown(),
+        fb_agg_fixsel: agg_fixsel_pre,
+        fb_agg_perm: agg_perm_pre,
+        fb_leaf_fixsel: agg_fixsel_pre, // leaf == agg at this stage
+        fb_leaf_perm: agg_perm_pre,
+        fb_pose_fixsel: pose_fixsel,
+        fb_pose_perm: pose_perm,
     };
 
     let agg_srs = filecoin_srs(agg_k);
@@ -433,6 +468,7 @@ fn main() {
     let agg_pk = keygen_pk(agg_vk.clone(), &default_agg_circuit).unwrap();
     println!("Computed AGG vk and pk in {:?}", start.elapsed());
 
+    // Default leaf-agg circuit for keygen (same CS as agg pre-keygen)
     let default_leaf_agg_circuit = AggCircuit {
         agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
         poseidon_vk: Some(poseidon_vk_data.clone()),
@@ -442,6 +478,12 @@ fn main() {
         right_proof: Value::unknown(),
         left_acc: Value::unknown(),
         right_acc: Value::unknown(),
+        fb_agg_fixsel: agg_fixsel_pre,
+        fb_agg_perm: agg_perm_pre,
+        fb_leaf_fixsel: agg_fixsel_pre,
+        fb_leaf_perm: agg_perm_pre,
+        fb_pose_fixsel: pose_fixsel,
+        fb_pose_perm: pose_perm,
     };
 
     let leaf_agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>> =
@@ -449,25 +491,43 @@ fn main() {
     let leaf_agg_pk = keygen_pk(leaf_agg_vk.clone(), &default_leaf_agg_circuit).unwrap();
     println!("Computed leaf AGG vk and pk in {:?}", start.elapsed());
 
+    // *** Recompute sizes from actual VKs (post-keygen) ***
+    let agg_fixsel = agg_vk.cs().num_fixed_columns() + agg_vk.cs().num_selectors();
+    let agg_perm = agg_vk.cs().permutation().columns.len();
+
+    let leaf_fixsel = leaf_agg_vk.cs().num_fixed_columns() + leaf_agg_vk.cs().num_selectors();
+    let leaf_perm = leaf_agg_vk.cs().permutation().columns.len();
+
+    // Fixed bases per VK (consistent prefixes)
     let mut agg_fixed_bases = BTreeMap::new();
     agg_fixed_bases.insert(String::from("com_instance"), C::identity());
     agg_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
-        "agg_vk", &agg_vk,
+        "agg_vk",
+        &agg_vk,
     ));
 
-    let mut leaf_agg_fixed_bases = BTreeMap::new();
+    let mut leaf_agg_fixed_bases: BTreeMap<String, midnight_curves::G1Projective> = BTreeMap::new();
     leaf_agg_fixed_bases.insert(String::from("com_instance"), C::identity());
     leaf_agg_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
-        "agg_vk",
+        "leaf_agg_vk",
         &leaf_agg_vk,
     ));
+
+    // Combined bases (optional diagnostics)
+    let mut combined_fixed_bases: BTreeMap<String, midnight_curves::G1Projective> = BTreeMap::new();
+    combined_fixed_bases.insert(String::from("com_instance"), C::identity());
+    combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>("agg_vk", &agg_vk));
+    combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>("leaf_agg_vk", &leaf_agg_vk));
+    combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>("poseidon_vk", poseidon_vk.vk()));
 
     let agg_srs = Arc::new(agg_srs);
     let agg_vk = Arc::new(agg_vk);
     let agg_pk = Arc::new(agg_pk);
 
-    // Names for each VK shape
+    // Names for each VK shape (consistent prefixes; include "~G")
     let poseidon_fixed_base_names = fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1);
+    let leaf_agg_fixed_base_names = fixed_base_names_for("leaf_agg_vk", &leaf_agg_vk.cs());
+    let agg_fixed_base_names = fixed_base_names_for("agg_vk", &agg_vk.cs());
 
     // Trivial accumulators *with matching shapes*
     let trivial_poseidon_pi: Accumulator<S> = trivial_acc_with_names(&poseidon_fixed_base_names);
@@ -475,6 +535,16 @@ fn main() {
     let agg_fixed_bases = Arc::new(agg_fixed_bases);
     let leaf_agg_fixed_bases = Arc::new(leaf_agg_fixed_bases);
     let poseidon_fixed_bases = Arc::new(poseidon_fixed_bases);
+    let trivial_leaf_agg: Accumulator<S> = trivial_acc_with_names(&leaf_agg_fixed_base_names);
+    let trivial_agg: Accumulator<S> = trivial_acc_with_names(&agg_fixed_base_names);
+
+    let mut trivial_combined =
+        Accumulator::accumulate(&[trivial_poseidon_pi, trivial_leaf_agg, trivial_agg]);
+    trivial_combined.collapse(); // keep (1,1) for committed sides
+    println!(
+        "trivial acc combined {:?}",
+        trivial_combined.rhs().fixed_base_scalars()
+    );
 
     // Create POSEIDON leaf proofs
     let num_leaves = 4;
@@ -540,14 +610,20 @@ fn main() {
                 Value::known(leaf_agg_vk.transcript_repr()),
             );
             let circuit = AggCircuit {
-                agg_vk: leaf_agg_vk_data, // Doesn't matter what it is, it is unused -- poseidon_vk is instead used
+                agg_vk: leaf_agg_vk_data, // unused; poseidon_vk below selects leaf mode
                 poseidon_vk: Some(poseidon_vk_data.clone()),
                 left_state: Value::known(*left_state),
                 right_state: Value::known(*right_state),
                 left_proof: Value::known(left_proof.clone()),
                 right_proof: Value::known(right_proof.clone()),
-                left_acc: Value::known(trivial_poseidon_pi.clone()),
-                right_acc: Value::known(trivial_poseidon_pi.clone()),
+                left_acc: Value::known(trivial_combined.clone()),
+                right_acc: Value::known(trivial_combined.clone()),
+                fb_agg_fixsel: agg_fixsel,
+                fb_agg_perm: agg_perm,
+                fb_leaf_fixsel: leaf_fixsel,
+                fb_leaf_perm: leaf_perm,
+                fb_pose_fixsel: pose_fixsel,
+                fb_pose_perm: pose_perm,
             };
 
             let proof_acc_left = verify_and_extract_acc(
@@ -568,9 +644,9 @@ fn main() {
 
             let mut accumulated_pi = Accumulator::accumulate(&[
                 proof_acc_left.clone(),
-                trivial_poseidon_pi.clone(),
+                trivial_combined.clone(),
                 proof_acc_right.clone(),
-                trivial_poseidon_pi.clone(),
+                trivial_combined.clone(),
             ]);
             accumulated_pi.collapse();
 
@@ -600,7 +676,7 @@ fn main() {
             };
             println!("Leaf AGG {} created in {:?}", i, start.elapsed());
 
-            // Use POSEIDON fixed bases for verification (not AGG fixed bases!)
+            // Verify leaf-agg proof with LEAF_AGG fixed bases
             let proof_acc = verify_and_extract_acc(
                 &agg_srs,
                 &leaf_agg_vk,
@@ -662,6 +738,12 @@ fn main() {
                     right_proof: Value::known(right.proof.clone()),
                     left_acc: Value::known(left.pi_acc.clone()),
                     right_acc: Value::known(right.pi_acc.clone()),
+                    fb_agg_fixsel: agg_fixsel,
+                    fb_agg_perm: agg_perm,
+                    fb_leaf_fixsel: leaf_fixsel,
+                    fb_leaf_perm: leaf_perm,
+                    fb_pose_fixsel: pose_fixsel,
+                    fb_pose_perm: pose_perm,
                 };
 
                 let mut accumulated_pi = Accumulator::accumulate(&[
@@ -716,7 +798,7 @@ fn main() {
                     start.elapsed()
                 );
 
-                // Use AGG fixed bases for internal nodes
+                // Verify internal AGG proof with AGG fixed bases
                 let proof_acc = verify_and_extract_acc(
                     &agg_srs,
                     &agg_vk,
