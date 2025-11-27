@@ -45,15 +45,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
-name = "bench_macros"
-version = "0.1.0"
-source = "git+https://github.com/midnightntwrk/midnight-zk#da2544ce7ce1ce9ffcddc286369c47c0dabb642d"
-dependencies = [
- "quote",
- "syn 2.0.108",
-]
-
-[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -507,7 +498,7 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 [[package]]
 name = "midnight-aggregator"
 version = "0.1.2"
-source = "git+https://github.com/midnightntwrk/midnight-zk#da2544ce7ce1ce9ffcddc286369c47c0dabb642d"
+source = "git+https://github.com/jtcoolen/midnight-zk?branch=julian%2Fnf#dd57659cd13e72c0f219b5f440142056db8a58b3"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -523,10 +514,9 @@ dependencies = [
 [[package]]
 name = "midnight-circuits"
 version = "5.0.1"
-source = "git+https://github.com/midnightntwrk/midnight-zk#da2544ce7ce1ce9ffcddc286369c47c0dabb642d"
+source = "git+https://github.com/jtcoolen/midnight-zk?branch=julian%2Fnf#dd57659cd13e72c0f219b5f440142056db8a58b3"
 dependencies = [
  "base64",
- "bench_macros",
  "bincode",
  "blake2b_simd",
  "ff",
@@ -547,7 +537,7 @@ dependencies = [
 [[package]]
 name = "midnight-curves"
 version = "0.1.1"
-source = "git+https://github.com/midnightntwrk/midnight-zk#da2544ce7ce1ce9ffcddc286369c47c0dabb642d"
+source = "git+https://github.com/jtcoolen/midnight-zk?branch=julian%2Fnf#dd57659cd13e72c0f219b5f440142056db8a58b3"
 dependencies = [
  "bitvec",
  "blst",
@@ -566,9 +556,8 @@ dependencies = [
 [[package]]
 name = "midnight-proofs"
 version = "0.5.1"
-source = "git+https://github.com/midnightntwrk/midnight-zk#da2544ce7ce1ce9ffcddc286369c47c0dabb642d"
+source = "git+https://github.com/jtcoolen/midnight-zk?branch=julian%2Fnf#dd57659cd13e72c0f219b5f440142056db8a58b3"
 dependencies = [
- "bench_macros",
  "blake2b_simd",
  "ff",
  "getrandom",

@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-midnight-circuits = { git = "https://github.com/midnightntwrk/midnight-zk" }
-midnight-aggregator = { git = "https://github.com/midnightntwrk/midnight-zk" }
-midnight-curves = { git = "https://github.com/midnightntwrk/midnight-zk" }
-midnight-proofs = { git = "https://github.com/midnightntwrk/midnight-zk" }
+midnight-circuits = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
+midnight-aggregator = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
+midnight-curves = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
+midnight-proofs = { git = "https://github.com/jtcoolen/midnight-zk", branch = "julian/nf" }
 sha2 = "0.10.9"
 rand = "0.8"
 rand_chacha = "0.3"
