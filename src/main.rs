@@ -170,7 +170,6 @@ pub struct AggCircuit {
     left_prev_level: Value<F>,
     right_prev_level: Value<F>,
     is_leaf: bool,
-    is_first_internal_node: bool,
 }
 
 fn configure_agg_circuit(
@@ -259,9 +258,7 @@ impl Circuit<F> for AggCircuit {
             scalar_chip.assign(&mut layouter, self.left_prev_level)?;
         let right_prev_level: AssignedNative<F> =
             scalar_chip.assign(&mut layouter, self.right_prev_level)?;
-        let prev_level_equal: AssignedBit<midnight_curves::Fq> =
-            native_chip.is_equal(&mut layouter, &left_prev_level, &right_prev_level)?;
-        native_chip.assert_equal_to_fixed(&mut layouter, &prev_level_equal, true)?;
+        native_chip.assert_equal(&mut layouter, &left_prev_level, &right_prev_level)?;
 
         let prev_level = scalar_chip.assign(&mut layouter, self.left_prev_level)?;
         let next_level = scalar_chip.add_constant(&mut layouter, &prev_level, F::ONE)?;
@@ -287,15 +284,11 @@ impl Circuit<F> for AggCircuit {
             self.agg_vk_name,
             if self.is_leaf {
                 &self.poseidon_vk.0
-            } else if self.is_first_internal_node {
-                &self.leaf_agg_vk.0
             } else {
                 &self.agg_vk.0
             },
             if self.is_leaf {
                 &self.poseidon_vk.1
-            } else if self.is_first_internal_node {
-                &self.leaf_agg_vk.1
             } else {
                 &self.agg_vk.1
             },
@@ -367,10 +360,6 @@ impl Circuit<F> for AggCircuit {
 
         Value::known(self.is_leaf)
             .zip(is_genesis.value())
-            .map(|(a, b)| assert!(a == b));
-
-        Value::known(self.is_first_internal_node)
-            .zip(children_are_genesis.value())
             .map(|(a, b)| assert!(a == b));
 
         let assigned_left_pi = if self.is_leaf {
@@ -530,7 +519,6 @@ fn main() {
     let combined_fixed_base_names_keygen: Vec<String> = {
         let poseidon_fb = fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1);
         let leaf_agg_fb = fixed_base_names_for("agg_vk", &agg_cs);
-        let first_agg_fb = fixed_base_names_for("agg_vk", &agg_cs);
         let agg_fb = fixed_base_names_for("agg_vk", &agg_cs);
 
         let mut set = BTreeSet::new();
@@ -538,7 +526,6 @@ fn main() {
         for name in poseidon_fb
             .iter()
             .chain(leaf_agg_fb.iter())
-            .chain(first_agg_fb.iter())
             .chain(agg_fb.iter())
         {
             if set.insert(name.clone()) {
@@ -563,7 +550,6 @@ fn main() {
         left_prev_level: Value::unknown(),
         right_prev_level: Value::unknown(),
         leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
-        is_first_internal_node: false,
     };
 
     let agg_srs = filecoin_srs(K);
@@ -588,7 +574,6 @@ fn main() {
         left_acc: Value::unknown(),
         right_acc: Value::unknown(),
         fixed_base_names: combined_fixed_base_names_keygen.clone(),
-        is_first_internal_node: false,
     };
 
     let leaf_agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>> =
@@ -603,7 +588,6 @@ fn main() {
         poseidon_vk: poseidon_vk_data.clone(),
         leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
         is_leaf: false,
-        is_first_internal_node: false,
         left_prev_level: Value::unknown(),
         right_prev_level: Value::unknown(),
         left_state: Value::unknown(),
@@ -617,7 +601,6 @@ fn main() {
 
     let first_internal_vk: VerifyingKey<midnight_curves::Fq, KZGCommitmentScheme<Bls12>> =
         keygen_vk_with_k(&agg_srs, &default_first_internal, K).unwrap();
-    let first_internal_pk = keygen_pk(first_internal_vk.clone(), &default_first_internal).unwrap();
 
     println!("Computed first AGG vk and pk in {:?}", start.elapsed());
     println!("first agg vk {:?}", first_internal_vk.transcript_repr());
@@ -635,14 +618,6 @@ fn main() {
         &leaf_agg_vk,
     ));
 
-    let mut first_agg_fixed_bases: BTreeMap<String, midnight_curves::G1Projective> =
-        BTreeMap::new();
-    first_agg_fixed_bases.insert(String::from("com_instance"), C::identity());
-    first_agg_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
-        "agg_vk",
-        &first_internal_vk,
-    ));
-
     let mut combined_fixed_bases: BTreeMap<String, midnight_curves::G1Projective> = BTreeMap::new();
     combined_fixed_bases.insert(String::from("com_instance"), C::identity());
     combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
@@ -651,10 +626,6 @@ fn main() {
     combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
         "agg_vk",
         &leaf_agg_vk,
-    ));
-    combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
-        "agg_vk",
-        &first_internal_vk,
     ));
     combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
         "poseidon_vk",
@@ -667,7 +638,6 @@ fn main() {
 
     let poseidon_fixed_base_names = fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1);
     let leaf_agg_fixed_base_names = fixed_base_names_for("agg_vk", &leaf_agg_vk.cs());
-    let first_agg_fixed_base_names = fixed_base_names_for("agg_vk", &first_internal_vk.cs());
     let agg_fixed_base_names = fixed_base_names_for("agg_vk", &agg_vk.cs());
 
     let combined_fixed_base_names: Vec<String> = {
@@ -676,7 +646,6 @@ fn main() {
         for name in poseidon_fixed_base_names
             .iter()
             .chain(leaf_agg_fixed_base_names.iter())
-            .chain(first_agg_fixed_base_names.iter())
             .chain(agg_fixed_base_names.iter())
         {
             if set.insert(name.clone()) {
@@ -690,18 +659,12 @@ fn main() {
 
     let agg_fixed_bases = Arc::new(agg_fixed_bases);
     let leaf_agg_fixed_bases = Arc::new(leaf_agg_fixed_bases);
-    let first_agg_fixed_bases = Arc::new(first_agg_fixed_bases);
     let poseidon_fixed_bases = Arc::new(poseidon_fixed_bases);
     let trivial_leaf_agg: Accumulator<S> = trivial_acc_with_names(&leaf_agg_fixed_base_names);
     let trivial_agg: Accumulator<S> = trivial_acc_with_names(&agg_fixed_base_names);
-    let trivial_first_agg: Accumulator<S> = trivial_acc_with_names(&first_agg_fixed_base_names);
 
-    let mut trivial_combined = Accumulator::accumulate(&[
-        trivial_poseidon_pi,
-        trivial_leaf_agg,
-        trivial_first_agg,
-        trivial_agg,
-    ]);
+    let mut trivial_combined =
+        Accumulator::accumulate(&[trivial_poseidon_pi, trivial_leaf_agg, trivial_agg]);
     trivial_combined.collapse();
     println!(
         "trivial acc combined {:?}",
@@ -789,7 +752,6 @@ fn main() {
                 left_prev_level: Value::known(F::ZERO),
                 right_prev_level: Value::known(F::ZERO),
                 leaf_agg_vk: leaf_agg_vk_data.clone(),
-                is_first_internal_node: false,
             };
 
             let proof_acc_left = verify_and_extract_acc(
@@ -900,7 +862,6 @@ fn main() {
                     left_prev_level: Value::known(F::from(level)),
                     right_prev_level: Value::known(F::from(level)),
                     leaf_agg_vk: leaf_agg_vk_data.clone(),
-                    is_first_internal_node: level == 1,
                 };
 
                 let mut accumulated_pi = Accumulator::accumulate(&[
@@ -917,19 +878,7 @@ fn main() {
                     agg_vk.as_ref()
                 };
 
-                let (pk_to_use, vk_to_verify) = if level == 1 {
-                    (&first_internal_pk, &first_internal_vk)
-                } else {
-                    (&*agg_pk, agg_vk.as_ref())
-                };
-
-                let fixed_bases = if level == 1 {
-                    first_agg_fixed_bases.as_ref()
-                } else {
-                    agg_fixed_bases.as_ref()
-                };
-
-                let mut public_inputs = AssignedVk::<S>::as_public_input(input_agg_vk);
+                let mut public_inputs = AssignedVk::<S>::as_public_input(&input_agg_vk);
                 public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
                 public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
                 public_inputs.extend(AssignedNative::<F>::as_public_input(&F::from(level + 1)));
@@ -945,7 +894,7 @@ fn main() {
                         AggCircuit,
                     >(
                         &agg_srs,
-                        &pk_to_use,
+                        &agg_pk,
                         &[circuit],
                         1,
                         &[&[&[], &public_inputs]],
@@ -964,8 +913,8 @@ fn main() {
 
                 let proof_acc = verify_and_extract_acc(
                     &agg_srs,
-                    &vk_to_verify,
-                    &fixed_bases,
+                    &agg_vk,
+                    &agg_fixed_bases,
                     &proof,
                     &public_inputs,
                 );
