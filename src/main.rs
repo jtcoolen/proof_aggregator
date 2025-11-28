@@ -99,6 +99,7 @@ fn binary_select_vk(
     agg_vk_prefix: &[AssignedNative<F>],
     bit: &AssignedBit<F>,
 ) -> Result<Vec<AssignedNative<F>>, Error> {
+    // note length is always 1
     assert_eq!(poseidon_vk_prefix.len(), agg_vk_prefix.len());
     let mut out = Vec::with_capacity(poseidon_vk_prefix.len());
     for i in 0..poseidon_vk_prefix.len() {
@@ -178,6 +179,8 @@ pub struct AggCircuit {
     is_genesis: Value<bool>,
     // true iff is_genesis is true
     is_leaf: bool,
+
+    is_first_internal_node: bool,
 
     left_is_genesis: Value<bool>,
     right_is_genesis: Value<bool>,
@@ -267,10 +270,13 @@ impl Circuit<F> for AggCircuit {
 
         let is_genesis: AssignedBit<F> = native_chip.assign(&mut layouter, self.is_genesis)?;
 
+        // we need an additional anchor/counter/level public input to decide whether we're at genesis and update the counter and link the proofs together
         let left_is_genesis: AssignedBit<F> =
             native_chip.assign(&mut layouter, self.left_is_genesis)?;
         let right_is_genesis: AssignedBit<F> =
             native_chip.assign(&mut layouter, self.right_is_genesis)?;
+
+        // btw genesis meant to be public input
 
         // Determine which VK is used for verification:
         // - poseidon_vk for leaf AGG circuits (verifying Poseidon proofs)
@@ -288,11 +294,23 @@ impl Circuit<F> for AggCircuit {
         // if is_genesis: use poseidon_vk
         let vk_val: AssignedNative<F> =
             native_chip.select(&mut layouter, &is_genesis, &poseidon_vk, &vk_val)?;
-        // a priori agg and leaf vk share same cs and domain (but not name)
+        // a priori agg and leaf vk share same cs and domain (but not name) TODO check if this is true?
         let assigned_vk: AssignedVk<S> = verifier_chip.assign_vk(
             self.agg_vk_name,
-            &self.agg_vk.0,
-            &self.agg_vk.1,
+            if self.is_leaf {
+                &self.poseidon_vk.0
+            } else if self.is_first_internal_node  {
+                &self.leaf_agg_vk.0
+            } else {
+                &self.agg_vk.0
+            },
+            if self.is_leaf {
+                &self.poseidon_vk.1
+            } else if self.is_first_internal_node {
+                &self.leaf_agg_vk.1
+            } else {
+                &self.agg_vk.1
+            },
             vk_val.clone(),
         )?;
         native_chip.constrain_as_public_input(&mut layouter, &vk_val)?;
@@ -348,9 +366,13 @@ impl Circuit<F> for AggCircuit {
         // For leaf nodes (verifying Poseidon proofs), the child public input is just the state.
         // For internal nodes (verifying AGG/leaf-AGG proofs), the public inputs are [vk, state, acc, is_genesis].
 
-        // sanity check
+        // sanity checks
         Value::known(self.is_leaf)
             .zip(is_genesis.value())
+            .map(|(a, b)| assert!(a == b));
+
+        Value::known(self.is_first_internal_node)
+            .zip(children_are_genesis.value())
             .map(|(a, b)| assert!(a == b));
 
         let assigned_left_pi = if self.is_leaf {
@@ -518,6 +540,7 @@ fn main() {
         left_is_genesis: Value::unknown(),
         right_is_genesis: Value::unknown(),
         leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
+        is_first_internal_node: false,
     };
 
     let agg_srs = filecoin_srs(agg_k);
@@ -544,6 +567,7 @@ fn main() {
         left_acc: Value::unknown(),
         right_acc: Value::unknown(),
         fixed_base_names: combined_fixed_base_names_keygen.clone(),
+        is_first_internal_node: false,
     };
 
     let leaf_agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>> =
@@ -707,6 +731,7 @@ fn main() {
                 left_is_genesis: Value::known(false), // value not used in leaf mode
                 right_is_genesis: Value::known(false), // value not used in leaf mode
                 leaf_agg_vk: leaf_agg_vk_data.clone(),
+                is_first_internal_node: false,
             };
 
             let proof_acc_left = verify_and_extract_acc(
@@ -820,6 +845,7 @@ fn main() {
                     left_is_genesis: Value::known(level == 1),
                     right_is_genesis: Value::known(level == 1),
                     leaf_agg_vk: leaf_agg_vk_data.clone(),
+                    is_first_internal_node: level == 1,
                 };
 
                 let mut accumulated_pi = Accumulator::accumulate(&[
@@ -832,15 +858,9 @@ fn main() {
 
                 // Public inputs depend on which relation this level verifies
                 let input_agg_vk = if level == 1 {
-                    &agg_vk.as_ref()
+                    &leaf_agg_vk
                 } else {
                     agg_vk.as_ref()
-                };
-
-                let input_agg_pk = if level == 1 {
-                    &agg_pk.as_ref()
-                } else {
-                    agg_pk.as_ref()
                 };
 
                 let mut public_inputs = AssignedVk::<S>::as_public_input(input_agg_vk);
@@ -858,7 +878,7 @@ fn main() {
                         AggCircuit,
                     >(
                         &agg_srs,
-                        &input_agg_pk,
+                        &agg_pk,
                         &[circuit],
                         1,
                         &[&[&[], &public_inputs]],
@@ -878,10 +898,10 @@ fn main() {
                 // Verify internal AGG proof:
                 //  - level 1: vk = leaf_agg_vk, bases = leaf_agg_fixed_bases
                 //  - level >1: vk = agg_vk, bases = agg_fixed_bases
-                let (verify_vk, verify_fixed_bases) = if level == 1 {
-                    (&leaf_agg_vk, &*leaf_agg_fixed_bases)
-                } else {
-                    (agg_vk.as_ref(), &*agg_fixed_bases)
+                let (verify_vk, verify_fixed_bases) =  { //if level == 1 {
+                //    (&leaf_agg_vk, &*leaf_agg_fixed_bases)
+                //} else {
+                    (agg_vk.as_ref(), &combined_fixed_bases)
                 };
 
                 let proof_acc = verify_and_extract_acc(
