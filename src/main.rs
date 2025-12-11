@@ -1,7 +1,7 @@
 use halo2curves::{ff::Field, group::Group};
 use midnight_circuits::compact_std_lib::MidnightCircuit;
 use midnight_circuits::hash::poseidon::PoseidonState;
-use midnight_circuits::types::{AssignedBit, AssignedForeignPoint, InnerValue};
+use midnight_circuits::types::{AssignedBit, AssignedForeignPoint};
 use midnight_circuits::{
     compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch},
     ecc::{
@@ -95,17 +95,14 @@ fn filecoin_srs(k: u32) -> ParamsKZG<Bls12> {
 fn binary_select_vk(
     layouter: &mut impl Layouter<F>,
     native_chip: &NativeChip<F>,
-    poseidon_vk_prefix: &[AssignedNative<F>],
-    agg_vk_prefix: &[AssignedNative<F>],
+    vk_a: &[AssignedNative<F>],
+    vk_b: &[AssignedNative<F>],
     bit: &AssignedBit<F>,
 ) -> Result<Vec<AssignedNative<F>>, Error> {
-    assert_eq!(poseidon_vk_prefix.len(), agg_vk_prefix.len());
-    let mut out = Vec::with_capacity(poseidon_vk_prefix.len());
-    for i in 0..poseidon_vk_prefix.len() {
-        let sel = native_chip.select(layouter, bit, &poseidon_vk_prefix[i], &agg_vk_prefix[i])?;
-        out.push(sel);
-    }
-    Ok(out)
+    assert_eq!(vk_a.len(), vk_b.len());
+    (0..vk_a.len())
+        .map(|i| native_chip.select(layouter, bit, &vk_a[i], &vk_b[i]))
+        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -167,8 +164,7 @@ pub struct AggCircuit {
     left_acc: Value<Accumulator<S>>,
     right_acc: Value<Accumulator<S>>,
     fixed_base_names: Vec<String>,
-    left_prev_level: Value<F>,
-    right_prev_level: Value<F>,
+    prev_level: Value<F>,
     is_leaf: bool,
 }
 
@@ -253,34 +249,27 @@ impl Circuit<F> for AggCircuit {
         let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
         let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
-        // enforce self.left_prev_level == self.right_prev_level
-        let left_prev_level: AssignedNative<F> =
-            scalar_chip.assign(&mut layouter, self.left_prev_level)?;
-        let right_prev_level: AssignedNative<F> =
-            scalar_chip.assign(&mut layouter, self.right_prev_level)?;
-        native_chip.assert_equal(&mut layouter, &left_prev_level, &right_prev_level)?;
-
-        let prev_level = scalar_chip.assign(&mut layouter, self.left_prev_level)?;
+        // Assign and compute level information
+        let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
         let next_level = scalar_chip.add_constant(&mut layouter, &prev_level, F::ONE)?;
-
-        // enforce prev_level = 0 iff is_genesis true
         let is_genesis = scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::ZERO)?;
-        // enforce children_are_genesis true iff prev_level = 1
-        let children_are_genesis: AssignedBit<F> =
+        let children_are_genesis =
             scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::ONE)?;
+        let is_level_2 =
+            scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
 
+        // Assign VKs
         let poseidon_vk: AssignedNative<F> =
             native_chip.assign(&mut layouter, self.poseidon_vk.2)?;
-        let leaf_agg_vk: AssignedNative<F> =
-            native_chip.assign(&mut layouter, self.leaf_agg_vk.2)?;
-        let agg_vk: AssignedNative<F> = native_chip.assign(&mut layouter, self.agg_vk.2)?;
+        let leaf_agg_vk = native_chip.assign(&mut layouter, self.leaf_agg_vk.2)?;
+        let agg_vk = native_chip.assign(&mut layouter, self.agg_vk.2)?;
 
-        let vk_val: AssignedNative<F> =
+        // Select correct VK based on level
+        let vk_val =
             native_chip.select(&mut layouter, &children_are_genesis, &leaf_agg_vk, &agg_vk)?;
-        let vk_val: AssignedNative<F> =
-            native_chip.select(&mut layouter, &is_genesis, &poseidon_vk, &vk_val)?;
+        let vk_val = native_chip.select(&mut layouter, &is_genesis, &poseidon_vk, &vk_val)?;
 
-        let assigned_vk: AssignedVk<S> = verifier_chip.assign_vk(
+        let assigned_vk = verifier_chip.assign_vk(
             self.agg_vk_name,
             if self.is_leaf {
                 &self.poseidon_vk.0
@@ -296,26 +285,24 @@ impl Circuit<F> for AggCircuit {
         )?;
         native_chip.constrain_as_public_input(&mut layouter, &vk_val)?;
 
-        let assigned_vk_inner_poseidon: AssignedVk<S> = verifier_chip.assign_vk(
+        // Assign inner VKs for public input selection
+        let assigned_vk_poseidon = verifier_chip.assign_vk(
             "poseidon_vk",
             &self.poseidon_vk.0,
             &self.poseidon_vk.1,
             poseidon_vk,
         )?;
-
-        let assigned_vk_inner_agg: AssignedVk<S> =
+        let assigned_vk_agg =
             verifier_chip.assign_vk("agg_vk", &self.agg_vk.0, &self.agg_vk.1, agg_vk)?;
-
-        let assigned_vk_inner_leaf_agg: AssignedVk<S> =
+        let assigned_vk_leaf_agg =
             verifier_chip.assign_vk("agg_vk", &self.agg_vk.0, &self.agg_vk.1, leaf_agg_vk)?;
 
         let poseidon_vk_elts =
-            verifier_chip.as_public_input(&mut layouter, &assigned_vk_inner_poseidon)?;
-        let agg_vk_elts = verifier_chip.as_public_input(&mut layouter, &assigned_vk_inner_agg)?;
+            verifier_chip.as_public_input(&mut layouter, &assigned_vk_poseidon)?;
+        let agg_vk_elts = verifier_chip.as_public_input(&mut layouter, &assigned_vk_agg)?;
+        let leaf_vk_elts = verifier_chip.as_public_input(&mut layouter, &assigned_vk_leaf_agg)?;
 
-        let leaf_vk_elts =
-            verifier_chip.as_public_input(&mut layouter, &assigned_vk_inner_leaf_agg)?;
-
+        // Select inner VK public inputs based on level
         let vk_inner_pi = binary_select_vk(
             &mut layouter,
             &native_chip,
@@ -323,12 +310,6 @@ impl Circuit<F> for AggCircuit {
             &agg_vk_elts,
             &children_are_genesis,
         )?;
-
-        // is_level_2 iff prev_level == 2
-        let is_level_2 =
-            scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
-
-        // if level 2 then leaf_agg_vk else agg_vk
         let vk_inner_pi = binary_select_vk(
             &mut layouter,
             &native_chip,
@@ -337,16 +318,20 @@ impl Circuit<F> for AggCircuit {
             &is_level_2,
         )?;
 
+        // Compute next state
         let left_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.left_state)?;
         let right_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.right_state)?;
         let next_state =
             poseidon_chip.hash(&mut layouter, &[left_state.clone(), right_state.clone()])?;
         scalar_chip.constrain_as_public_input(&mut layouter, &next_state)?;
 
-        let id_point: AssignedForeignPoint<F, C, _> =
-            curve_chip.assign_fixed(&mut layouter, C::identity())?;
-        let fixed_base_names = self.fixed_base_names.clone();
+        let id_point: AssignedForeignPoint<
+            midnight_curves::Fq,
+            midnight_curves::G1Projective,
+            midnight_curves::G1Projective,
+        > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
+        // Process left child
         let left_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
@@ -354,22 +339,17 @@ impl Circuit<F> for AggCircuit {
             1,
             1,
             &[],
-            &fixed_base_names,
+            &self.fixed_base_names,
             self.left_acc.clone(),
         )?;
-
-        Value::known(self.is_leaf)
-            .zip(is_genesis.value())
-            .map(|(a, b)| assert!(a == b));
 
         let assigned_left_pi = if self.is_leaf {
             vec![left_state.clone()]
         } else {
-            let mut v: Vec<AssignedNative<F>> = Vec::new();
-            v.extend(vk_inner_pi.clone());
+            let mut v = vk_inner_pi.clone();
             v.push(left_state.clone());
             v.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
-            v.push(left_prev_level);
+            v.push(prev_level.clone());
             v
         };
 
@@ -382,6 +362,7 @@ impl Circuit<F> for AggCircuit {
         )?;
         left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
+        // Process right child
         let right_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
@@ -389,18 +370,17 @@ impl Circuit<F> for AggCircuit {
             1,
             1,
             &[],
-            &fixed_base_names,
+            &self.fixed_base_names,
             self.right_acc.clone(),
         )?;
 
         let assigned_right_pi = if self.is_leaf {
             vec![right_state.clone()]
         } else {
-            let mut v: Vec<AssignedNative<F>> = Vec::new();
-            v.extend(vk_inner_pi);
+            let mut v = vk_inner_pi;
             v.push(right_state.clone());
             v.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
-            v.push(right_prev_level);
+            v.push(prev_level);
             v
         };
 
@@ -413,6 +393,7 @@ impl Circuit<F> for AggCircuit {
         )?;
         right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
+        // Accumulate and output
         let mut next_acc = AssignedAccumulator::<S>::accumulate(
             &mut layouter,
             &verifier_chip,
@@ -423,7 +404,6 @@ impl Circuit<F> for AggCircuit {
 
         next_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
         verifier_chip.constrain_as_public_input(&mut layouter, &next_acc)?;
-
         scalar_chip.constrain_as_public_input(&mut layouter, &next_level)?;
 
         core_decomp_chip.load(&mut layouter)
@@ -438,10 +418,7 @@ struct TreeNode {
     pi_acc: Accumulator<S>,
 }
 
-fn fixed_base_names_for(
-    vk_name: &str,
-    cs: &midnight_proofs::plonk::ConstraintSystem<F>,
-) -> Vec<String> {
+fn fixed_base_names_for(vk_name: &str, cs: &ConstraintSystem<F>) -> Vec<String> {
     let mut names = vec![String::from("com_instance"), String::from("~G")];
     names.extend(midnight_circuits::verifier::fixed_base_names::<S>(
         vk_name,
@@ -451,12 +428,10 @@ fn fixed_base_names_for(
     names
 }
 
-fn trivial_acc_with_names(names: &[String]) -> midnight_circuits::verifier::Accumulator<S> {
+fn trivial_acc_with_names(names: &[String]) -> Accumulator<S> {
     use midnight_circuits::verifier::Msm;
-    use std::collections::BTreeMap;
     let fixed: BTreeMap<String, F> = names.iter().cloned().map(|n| (n, F::ZERO)).collect();
-
-    midnight_circuits::verifier::Accumulator::<S>::new(
+    Accumulator::<S>::new(
         Msm::new(&[C::default()], &[F::ONE], &BTreeMap::new()),
         Msm::new(&[C::default()], &[F::ONE], &fixed),
     )
@@ -464,44 +439,53 @@ fn trivial_acc_with_names(names: &[String]) -> midnight_circuits::verifier::Accu
 
 fn poseidon_tree_root(leaf_states: &[F]) -> F {
     use midnight_circuits::instructions::hash::HashCPU;
-
-    assert!(!leaf_states.is_empty(), "Need at least one leaf");
-    assert!(
-        leaf_states.len().is_power_of_two(),
-        "Number of leaves must be a power of two for this simple tree"
-    );
+    assert!(!leaf_states.is_empty() && leaf_states.len().is_power_of_two());
 
     let mut level_states = leaf_states.to_vec();
-
-    // Reproduce exactly the same “hash pairs up the tree” logic
     while level_states.len() > 1 {
-        assert!(
-            level_states.len() % 2 == 0,
-            "Level size must stay even while building the tree"
-        );
-
-        let mut next_level = Vec::with_capacity(level_states.len() / 2);
-
-        for pair in level_states.chunks(2) {
-            let parent = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[pair[0], pair[1]]);
-            next_level.push(parent);
-        }
-
-        level_states = next_level;
+        level_states = level_states
+            .chunks(2)
+            .map(|pair| <PoseidonChip<F> as HashCPU<F, F>>::hash(&[pair[0], pair[1]]))
+            .collect();
     }
-
     level_states[0]
 }
 
+fn verify_and_extract_acc(
+    srs: &ParamsKZG<Bls12>,
+    vk: &VerifyingKey<F, KZGCommitmentScheme<E>>,
+    fixed_bases: &BTreeMap<String, C>,
+    proof: &[u8],
+    public_inputs: &[F],
+) -> Accumulator<S> {
+    let mut transcript = CircuitTranscript::<PoseidonState<F>>::init_from_bytes(proof);
+    let dual_msm = prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>>(
+        vk,
+        &[&[C::identity()]],
+        &[&[public_inputs]],
+        &mut transcript,
+    )
+    .expect("Verification failed");
+
+    assert!(dual_msm.clone().check(&srs.verifier_params()));
+
+    let mut acc: Accumulator<S> = dual_msm.into();
+    acc.extract_fixed_bases(fixed_bases);
+    acc.collapse();
+    assert!(acc.check(&srs.s_g2().into(), fixed_bases));
+    acc
+}
+
 fn main() {
+    // Setup Poseidon circuit
     let poseidon_srs = filecoin_srs(POSEIDON_K);
     let poseidon_relation = PoseidonExample;
     let poseidon_vk = compact_std_lib::setup_vk(&poseidon_srs, &poseidon_relation);
     let poseidon_pk = compact_std_lib::setup_pk(&poseidon_relation, &poseidon_vk);
-    let poseidon_halo2_vk: &VerifyingKey<F, KZGCommitmentScheme<E>> = poseidon_vk.vk();
+    let poseidon_halo2_vk = poseidon_vk.vk();
     let poseidon_vk_data = (
-        EvaluationDomain::new(poseidon_vk.vk().cs().degree() as u32, POSEIDON_K),
-        poseidon_vk.vk().cs().clone(),
+        EvaluationDomain::new(poseidon_halo2_vk.cs().degree() as u32, POSEIDON_K),
+        poseidon_halo2_vk.cs().clone(),
         Value::known(poseidon_halo2_vk.transcript_repr()),
     );
 
@@ -512,21 +496,17 @@ fn main() {
         poseidon_halo2_vk,
     ));
 
+    // Setup aggregation circuit
     let mut agg_cs = ConstraintSystem::default();
     configure_agg_circuit(&mut agg_cs);
     let agg_domain = EvaluationDomain::new(agg_cs.degree() as u32, K);
 
     let combined_fixed_base_names_keygen: Vec<String> = {
-        let poseidon_fb = fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1);
-        let leaf_agg_fb = fixed_base_names_for("agg_vk", &agg_cs);
-        let agg_fb = fixed_base_names_for("agg_vk", &agg_cs);
-
         let mut set = BTreeSet::new();
         let mut v = Vec::new();
-        for name in poseidon_fb
+        for name in fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1)
             .iter()
-            .chain(leaf_agg_fb.iter())
-            .chain(agg_fb.iter())
+            .chain(fixed_base_names_for("agg_vk", &agg_cs).iter())
         {
             if set.insert(name.clone()) {
                 v.push(name.clone());
@@ -547,8 +527,7 @@ fn main() {
         right_acc: Value::unknown(),
         fixed_base_names: combined_fixed_base_names_keygen.clone(),
         is_leaf: false,
-        left_prev_level: Value::unknown(),
-        right_prev_level: Value::unknown(),
+        prev_level: Value::unknown(),
         leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
     };
 
@@ -557,53 +536,16 @@ fn main() {
     let agg_vk = keygen_vk_with_k(&agg_srs, &default_agg_circuit, K).unwrap();
     let agg_pk = keygen_pk(agg_vk.clone(), &default_agg_circuit).unwrap();
     println!("Computed AGG vk and pk in {:?}", start.elapsed());
-    println!("agg vk {:?}", agg_vk.transcript_repr());
 
     let default_leaf_agg_circuit = AggCircuit {
-        agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
         agg_vk_name: "poseidon_vk",
-        poseidon_vk: poseidon_vk_data.clone(),
-        left_prev_level: Value::unknown(),
-        right_prev_level: Value::unknown(),
         is_leaf: true,
-        leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
-        left_state: Value::unknown(),
-        right_state: Value::unknown(),
-        left_proof: Value::unknown(),
-        right_proof: Value::unknown(),
-        left_acc: Value::unknown(),
-        right_acc: Value::unknown(),
-        fixed_base_names: combined_fixed_base_names_keygen.clone(),
+        ..default_agg_circuit.clone()
     };
 
-    let leaf_agg_vk: VerifyingKey<F, KZGCommitmentScheme<E>> =
-        keygen_vk_with_k(&agg_srs, &default_leaf_agg_circuit, K).unwrap();
+    let leaf_agg_vk = keygen_vk_with_k(&agg_srs, &default_leaf_agg_circuit, K).unwrap();
     let leaf_agg_pk = keygen_pk(leaf_agg_vk.clone(), &default_leaf_agg_circuit).unwrap();
-    println!("Computed leaf AGG vk and pk in {:?}", start.elapsed());
-    println!("leaf agg vk {:?}", leaf_agg_vk.transcript_repr());
-
-    let default_first_internal = AggCircuit {
-        agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
-        agg_vk_name: "agg_vk",
-        poseidon_vk: poseidon_vk_data.clone(),
-        leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
-        is_leaf: false,
-        left_prev_level: Value::unknown(),
-        right_prev_level: Value::unknown(),
-        left_state: Value::unknown(),
-        right_state: Value::unknown(),
-        left_proof: Value::unknown(),
-        right_proof: Value::unknown(),
-        left_acc: Value::unknown(),
-        right_acc: Value::unknown(),
-        fixed_base_names: combined_fixed_base_names_keygen.clone(),
-    };
-
-    let first_internal_vk: VerifyingKey<midnight_curves::Fq, KZGCommitmentScheme<Bls12>> =
-        keygen_vk_with_k(&agg_srs, &default_first_internal, K).unwrap();
-
-    println!("Computed first AGG vk and pk in {:?}", start.elapsed());
-    println!("first agg vk {:?}", first_internal_vk.transcript_repr());
+    println!("Computed leaf AGG vk and pk");
 
     let mut agg_fixed_bases = BTreeMap::new();
     agg_fixed_bases.insert(String::from("com_instance"), C::identity());
@@ -611,14 +553,14 @@ fn main() {
         "agg_vk", &agg_vk,
     ));
 
-    let mut leaf_agg_fixed_bases: BTreeMap<String, midnight_curves::G1Projective> = BTreeMap::new();
+    let mut leaf_agg_fixed_bases = BTreeMap::new();
     leaf_agg_fixed_bases.insert(String::from("com_instance"), C::identity());
     leaf_agg_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
         "agg_vk",
         &leaf_agg_vk,
     ));
 
-    let mut combined_fixed_bases: BTreeMap<String, midnight_curves::G1Projective> = BTreeMap::new();
+    let mut combined_fixed_bases = BTreeMap::new();
     combined_fixed_bases.insert(String::from("com_instance"), C::identity());
     combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
         "agg_vk", &agg_vk,
@@ -636,17 +578,13 @@ fn main() {
     let agg_vk = Arc::new(agg_vk);
     let agg_pk = Arc::new(agg_pk);
 
-    let poseidon_fixed_base_names = fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1);
-    let leaf_agg_fixed_base_names = fixed_base_names_for("agg_vk", &leaf_agg_vk.cs());
-    let agg_fixed_base_names = fixed_base_names_for("agg_vk", &agg_vk.cs());
-
     let combined_fixed_base_names: Vec<String> = {
         let mut set = BTreeSet::new();
         let mut v = Vec::new();
-        for name in poseidon_fixed_base_names
+        for name in fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1)
             .iter()
-            .chain(leaf_agg_fixed_base_names.iter())
-            .chain(agg_fixed_base_names.iter())
+            .chain(fixed_base_names_for("agg_vk", &leaf_agg_vk.cs()).iter())
+            .chain(fixed_base_names_for("agg_vk", &agg_vk.cs()).iter())
         {
             if set.insert(name.clone()) {
                 v.push(name.clone());
@@ -655,38 +593,32 @@ fn main() {
         v
     };
 
-    let trivial_poseidon_pi: Accumulator<S> = trivial_acc_with_names(&poseidon_fixed_base_names);
-
-    let agg_fixed_bases = Arc::new(agg_fixed_bases);
-    let leaf_agg_fixed_bases = Arc::new(leaf_agg_fixed_bases);
-    let poseidon_fixed_bases = Arc::new(poseidon_fixed_bases);
-    let trivial_leaf_agg: Accumulator<S> = trivial_acc_with_names(&leaf_agg_fixed_base_names);
-    let trivial_agg: Accumulator<S> = trivial_acc_with_names(&agg_fixed_base_names);
+    let trivial_poseidon =
+        trivial_acc_with_names(&fixed_base_names_for("poseidon_vk", &poseidon_vk_data.1));
+    let trivial_leaf_agg =
+        trivial_acc_with_names(&fixed_base_names_for("agg_vk", &leaf_agg_vk.cs()));
+    let trivial_agg = trivial_acc_with_names(&fixed_base_names_for("agg_vk", &agg_vk.cs()));
 
     let mut trivial_combined =
-        Accumulator::accumulate(&[trivial_poseidon_pi, trivial_leaf_agg, trivial_agg]);
+        Accumulator::accumulate(&[trivial_poseidon, trivial_leaf_agg, trivial_agg]);
     trivial_combined.collapse();
-    println!(
-        "trivial acc combined {:?}",
-        trivial_combined.rhs().fixed_base_scalars()
-    );
 
     let leaf_agg_vk_data = (
-        EvaluationDomain::<F>::new(leaf_agg_vk.cs().degree() as u32, K),
+        EvaluationDomain::new(leaf_agg_vk.cs().degree() as u32, K),
         leaf_agg_vk.cs().clone(),
         Value::known(leaf_agg_vk.transcript_repr()),
     );
     let agg_vk_data = (
-        EvaluationDomain::<F>::new(agg_vk.cs().degree() as u32, K),
+        EvaluationDomain::new(agg_vk.cs().degree() as u32, K),
         agg_vk.cs().clone(),
         Value::known(agg_vk.transcript_repr()),
     );
 
+    // Generate leaf proofs
     let num_leaves = 8;
     println!("Creating {} POSEIDON leaf proofs...", num_leaves);
 
     let poseidon_proofs: Vec<(F, [F; 3], Vec<u8>)> = (0..num_leaves)
-        .into_iter()
         .map(|i| {
             use midnight_circuits::instructions::hash::HashCPU;
             use rand::SeedableRng;
@@ -726,15 +658,15 @@ fn main() {
         })
         .collect();
 
+    // Create leaf aggregation layer
     println!("\nCreating {} leaf AGG nodes...", num_leaves / 2);
 
     let mut current_level: Vec<TreeNode> = (0..num_leaves / 2)
-        .into_iter()
         .map(|i| {
+            use midnight_circuits::instructions::hash::HashCPU;
             let (left_state, _, left_proof) = &poseidon_proofs[i * 2];
             let (right_state, _, right_proof) = &poseidon_proofs[i * 2 + 1];
 
-            use midnight_circuits::instructions::hash::HashCPU;
             let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[*left_state, *right_state]);
 
             let circuit = AggCircuit {
@@ -749,36 +681,34 @@ fn main() {
                 right_acc: Value::known(trivial_combined.clone()),
                 fixed_base_names: combined_fixed_base_names.clone(),
                 is_leaf: true,
-                left_prev_level: Value::known(F::ZERO),
-                right_prev_level: Value::known(F::ZERO),
+                prev_level: Value::known(F::ZERO),
                 leaf_agg_vk: leaf_agg_vk_data.clone(),
             };
 
             let proof_acc_left = verify_and_extract_acc(
                 &poseidon_srs,
-                &poseidon_vk.vk(),
+                poseidon_vk.vk(),
                 &poseidon_fixed_bases,
-                &left_proof,
+                left_proof,
                 &[*left_state],
             );
-
             let proof_acc_right = verify_and_extract_acc(
                 &poseidon_srs,
-                &poseidon_vk.vk(),
+                poseidon_vk.vk(),
                 &poseidon_fixed_bases,
-                &right_proof,
+                right_proof,
                 &[*right_state],
             );
 
             let mut accumulated_pi = Accumulator::accumulate(&[
-                proof_acc_left.clone(),
+                proof_acc_left,
                 trivial_combined.clone(),
-                proof_acc_right.clone(),
+                proof_acc_right,
                 trivial_combined.clone(),
             ]);
             accumulated_pi.collapse();
 
-            let mut public_inputs = AssignedVk::<S>::as_public_input(&poseidon_vk.vk());
+            let mut public_inputs = AssignedVk::<S>::as_public_input(poseidon_vk.vk());
             public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
             public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
             public_inputs.extend(AssignedNative::<F>::as_public_input(&F::ONE));
@@ -817,11 +747,12 @@ fn main() {
                 state,
                 proof,
                 proof_acc,
-                pi_acc: accumulated_pi.clone(),
+                pi_acc: accumulated_pi,
             }
         })
         .collect();
 
+    // Build internal layers
     let mut level = 0;
     while current_level.len() > 1 {
         level += 1;
@@ -832,20 +763,12 @@ fn main() {
         );
 
         let next_level: Vec<TreeNode> = (0..current_level.len() / 2)
-            .into_iter()
-            .map(|pair_idx| {
-                let i = pair_idx * 2;
-                let left = current_level[i].clone();
-                let right = current_level[i + 1].clone();
-
+            .map(|i| {
                 use midnight_circuits::instructions::hash::HashCPU;
-                let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[left.state, right.state]);
+                let left = &current_level[i * 2];
+                let right = &current_level[i * 2 + 1];
 
-                let leaf_agg_vk_data = (
-                    EvaluationDomain::new(leaf_agg_vk.cs().degree() as u32, K),
-                    leaf_agg_vk.cs().clone(),
-                    Value::known(leaf_agg_vk.transcript_repr()),
-                );
+                let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[left.state, right.state]);
 
                 let circuit = AggCircuit {
                     agg_vk: agg_vk_data.clone(),
@@ -859,8 +782,7 @@ fn main() {
                     right_acc: Value::known(right.pi_acc.clone()),
                     fixed_base_names: combined_fixed_base_names.clone(),
                     is_leaf: false,
-                    left_prev_level: Value::known(F::from(level)),
-                    right_prev_level: Value::known(F::from(level)),
+                    prev_level: Value::known(F::from(level)),
                     leaf_agg_vk: leaf_agg_vk_data.clone(),
                 };
 
@@ -872,18 +794,17 @@ fn main() {
                 ]);
                 accumulated_pi.collapse();
 
-                let input_agg_vk = if level == 1 {
+                let input_vk = if level == 1 {
                     &leaf_agg_vk
                 } else {
                     agg_vk.as_ref()
                 };
 
-                let mut public_inputs = AssignedVk::<S>::as_public_input(&input_agg_vk);
+                let mut public_inputs = AssignedVk::<S>::as_public_input(input_vk);
                 public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
                 public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
                 public_inputs.extend(AssignedNative::<F>::as_public_input(&F::from(level + 1)));
 
-                println!("about to produce an internal AGG proof");
                 let start = Instant::now();
                 let proof = {
                     let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
@@ -907,7 +828,7 @@ fn main() {
                 println!(
                     "Level {} node {} created in {:?}",
                     level,
-                    pair_idx,
+                    i,
                     start.elapsed()
                 );
 
@@ -944,37 +865,4 @@ fn main() {
     );
     assert_eq!(root.state, expected_root, "Root state mismatch!");
     println!("✓ Root verification successful!");
-}
-
-fn verify_and_extract_acc(
-    srs: &ParamsKZG<Bls12>,
-    vk: &midnight_proofs::plonk::VerifyingKey<F, KZGCommitmentScheme<E>>,
-    fixed_bases: &BTreeMap<String, C>,
-    proof: &[u8],
-    plain_public_inputs: &[F],
-) -> Accumulator<S> {
-    let mut transcript = CircuitTranscript::<PoseidonState<F>>::init_from_bytes(proof);
-    let committed_bases: &[&[C]] = &[&[C::identity()]];
-    let instances: &[&[&[F]]] = &[&[plain_public_inputs]];
-
-    let dual_msm = prepare::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>>(
-        vk,
-        committed_bases,
-        instances,
-        &mut transcript,
-    )
-    .expect("Verification failed");
-
-    assert!(dual_msm.clone().check(&srs.verifier_params()));
-
-    let mut acc: Accumulator<S> = dual_msm.into();
-    acc.extract_fixed_bases(fixed_bases);
-    acc.collapse();
-
-    assert!(
-        acc.check(&srs.s_g2().into(), fixed_bases),
-        "Accumulator verification failed"
-    );
-
-    acc
 }
