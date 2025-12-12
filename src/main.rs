@@ -560,20 +560,6 @@ fn main() {
         &leaf_agg_vk,
     ));
 
-    let mut combined_fixed_bases = BTreeMap::new();
-    combined_fixed_bases.insert(String::from("com_instance"), C::identity());
-    combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
-        "agg_vk", &agg_vk,
-    ));
-    combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
-        "agg_vk",
-        &leaf_agg_vk,
-    ));
-    combined_fixed_bases.extend(midnight_circuits::verifier::fixed_bases::<S>(
-        "poseidon_vk",
-        poseidon_vk.vk(),
-    ));
-
     let agg_srs = Arc::new(agg_srs);
     let agg_vk = Arc::new(agg_vk);
     let agg_pk = Arc::new(agg_pk);
