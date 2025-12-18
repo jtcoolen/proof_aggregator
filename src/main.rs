@@ -22,10 +22,7 @@ use midnight_circuits::{
     },
     instructions::*,
     types::{AssignedNative, ComposableChip, Instantiable},
-    verifier::{
-        Accumulator, AssignedAccumulator, AssignedVk, BlstrsEmulation, SelfEmulation,
-        VerifierGadget,
-    },
+    verifier::{Accumulator, AssignedAccumulator, BlstrsEmulation, SelfEmulation, VerifierGadget},
 };
 use midnight_curves::Bls12;
 use midnight_proofs::poly::kzg::params::ParamsKZG;
@@ -279,8 +276,6 @@ impl Circuit<F> for AggCircuit {
             },
             vk_val.clone(),
         )?;
-        // assign VK as public input
-        native_chip.constrain_as_public_input(&mut layouter, &vk_val)?;
 
         // Select inner VK public inputs based on level
         let vk_inner_pi = native_chip.select(
@@ -298,7 +293,6 @@ impl Circuit<F> for AggCircuit {
         let right_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.right_state)?;
         let next_state =
             poseidon_chip.hash(&mut layouter, &[left_state.clone(), right_state.clone()])?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &next_state)?;
 
         let id_point: AssignedForeignPoint<
             midnight_curves::Fq,
@@ -325,7 +319,8 @@ impl Circuit<F> for AggCircuit {
             v.push(left_state.clone());
             v.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
             v.push(prev_level.clone());
-            v
+            let hashed_value = poseidon_chip.hash(&mut layouter, &v)?;
+            vec![hashed_value]
         };
 
         let mut left_proof_acc = verifier_chip.prepare(
@@ -356,7 +351,8 @@ impl Circuit<F> for AggCircuit {
             v.push(right_state.clone());
             v.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
             v.push(prev_level);
-            v
+            let hashed_value = poseidon_chip.hash(&mut layouter, &v)?;
+            vec![hashed_value]
         };
 
         let mut right_proof_acc = verifier_chip.prepare(
@@ -378,8 +374,18 @@ impl Circuit<F> for AggCircuit {
         )?;
 
         next_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-        verifier_chip.constrain_as_public_input(&mut layouter, &next_acc)?;
-        scalar_chip.constrain_as_public_input(&mut layouter, &next_level)?;
+
+        // Hash the would-be public inputs (vk, state, acc, level) into a single public input
+        let next_acc_pi = verifier_chip.as_public_input(&mut layouter, &next_acc)?;
+        let mut hash_inputs = Vec::new();
+        hash_inputs.push(vk_val);
+        hash_inputs.push(next_state);
+        hash_inputs.extend(next_acc_pi);
+        hash_inputs.push(next_level);
+        let agg_pi_hash = poseidon_chip.hash(&mut layouter, &hash_inputs)?;
+
+        // Expose only the hash as a public input of the aggregation circuit
+        native_chip.constrain_as_public_input(&mut layouter, &agg_pi_hash)?;
 
         core_decomp_chip.load(&mut layouter)
     }
@@ -449,6 +455,20 @@ fn verify_and_extract_acc(
     acc.collapse();
     assert!(acc.check(&srs.s_g2().into(), fixed_bases));
     acc
+}
+
+// Off-circuit helper to hash the would-be public inputs (vk, state, acc, level)
+// into a single field element that is used as the only public input of AggCircuit.
+fn agg_public_input_hash(vk_repr: F, state: F, acc: &Accumulator<S>, level: F) -> F {
+    use midnight_circuits::instructions::hash::HashCPU;
+
+    let mut inputs = Vec::new();
+    inputs.push(vk_repr);
+    inputs.push(state);
+    inputs.extend(AssignedAccumulator::as_public_input(acc));
+    inputs.push(level);
+
+    <PoseidonChip<F> as HashCPU<F, F>>::hash(&inputs)
 }
 
 fn main() {
@@ -669,10 +689,10 @@ fn main() {
             ]);
             accumulated_pi.collapse();
 
-            let mut public_inputs = AssignedVk::<S>::as_public_input(poseidon_vk.vk());
-            public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
-            public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
-            public_inputs.extend(AssignedNative::<F>::as_public_input(&F::ONE));
+            // Hash (vk, state, acc, level) into a single public input for the leaf agg circuit
+            let vk_repr = poseidon_halo2_vk.transcript_repr();
+            let public_input_hash = agg_public_input_hash(vk_repr, state, &accumulated_pi, F::ONE);
+            let public_inputs = vec![public_input_hash];
 
             let start = Instant::now();
             let proof = {
@@ -761,10 +781,12 @@ fn main() {
                     agg_vk.as_ref()
                 };
 
-                let mut public_inputs = AssignedVk::<S>::as_public_input(input_vk);
-                public_inputs.extend(AssignedNative::<F>::as_public_input(&state));
-                public_inputs.extend(AssignedAccumulator::as_public_input(&accumulated_pi));
-                public_inputs.extend(AssignedNative::<F>::as_public_input(&F::from(level + 1)));
+                // Hash (vk, state, acc, level+1) into a single public input for internal agg nodes
+                let vk_repr = input_vk.transcript_repr();
+                let next_level_f = F::from(level + 1);
+                let public_input_hash =
+                    agg_public_input_hash(vk_repr, state, &accumulated_pi, next_level_f);
+                let public_inputs = vec![public_input_hash];
 
                 let start = Instant::now();
                 let proof = {
