@@ -139,7 +139,7 @@ impl Relation for PoseidonExample {
 pub struct AggCircuit {
     agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
     agg_vk_name: &'static str,
-    poseidon_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
+    poseidon_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
     leaf_agg_vk: (EvaluationDomain<F>, ConstraintSystem<F>, Value<F>),
     left_state: Value<F>,
     right_state: Value<F>,
@@ -243,10 +243,8 @@ impl Circuit<F> for AggCircuit {
             scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
 
         // Poseidon vk transcript repr is a constant in both circuits
-        let mut poseidon_vk_repr = F::ZERO;
-        self.poseidon_vk.2.map(|v| poseidon_vk_repr = v);
         let poseidon_vk_val: AssignedNative<F> =
-            native_chip.assign_fixed(&mut layouter, poseidon_vk_repr)?;
+            native_chip.assign_fixed(&mut layouter, self.poseidon_vk.2)?;
 
         // Compute next state (Poseidon over children states)
         let left_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.left_state)?;
@@ -511,7 +509,7 @@ fn main() {
     let poseidon_vk_data = (
         EvaluationDomain::new(poseidon_halo2_vk.cs().degree() as u32, POSEIDON_K),
         poseidon_halo2_vk.cs().clone(),
-        Value::known(poseidon_halo2_vk.transcript_repr()),
+        poseidon_halo2_vk.transcript_repr(),
     );
 
     let mut poseidon_fixed_bases = BTreeMap::new();
