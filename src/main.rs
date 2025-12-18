@@ -242,53 +242,13 @@ impl Circuit<F> for AggCircuit {
         let is_level_2 =
             scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
 
-        // Assign poseidon vk as constant
+        // Poseidon vk transcript repr is a constant in both circuits
         let mut poseidon_vk_repr = F::ZERO;
         self.poseidon_vk.2.map(|v| poseidon_vk_repr = v);
-
         let poseidon_vk_val: AssignedNative<F> =
             native_chip.assign_fixed(&mut layouter, poseidon_vk_repr)?;
-        let agg_vk_val: AssignedNative<F> = native_chip.assign(&mut layouter, self.agg_vk.2)?;
-        let leaf_vk_val: AssignedNative<F> =
-            native_chip.assign(&mut layouter, self.leaf_agg_vk.2)?;
 
-        // Select correct VK used in the partial verification gadget based on level
-        let vk_val = native_chip.select(
-            &mut layouter,
-            &children_are_genesis,
-            &leaf_vk_val,
-            &agg_vk_val,
-        )?;
-        let vk_val = native_chip.select(&mut layouter, &is_genesis, &poseidon_vk_val, &vk_val)?;
-
-        // The assigned_vk is used in the partial verification gadget and directly affects the circuit shape
-        let assigned_vk = verifier_chip.assign_vk(
-            self.agg_vk_name,
-            if self.is_leaf {
-                &self.poseidon_vk.0
-            } else {
-                &self.agg_vk.0
-            },
-            if self.is_leaf {
-                &self.poseidon_vk.1
-            } else {
-                &self.agg_vk.1
-            },
-            vk_val.clone(),
-        )?;
-
-        // Select inner VK public inputs based on level
-        let vk_inner_pi = native_chip.select(
-            &mut layouter,
-            &children_are_genesis,
-            &poseidon_vk_val,
-            &agg_vk_val,
-        )?;
-
-        let vk_inner_pi =
-            native_chip.select(&mut layouter, &is_level_2, &leaf_vk_val, &vk_inner_pi)?;
-
-        // Compute next state
+        // Compute next state (Poseidon over children states)
         let left_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.left_state)?;
         let right_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.right_state)?;
         let next_state =
@@ -300,7 +260,7 @@ impl Circuit<F> for AggCircuit {
             midnight_curves::G1Projective,
         > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
-        // Process left child
+        // Assigned accumulators for children
         let left_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
@@ -311,28 +271,6 @@ impl Circuit<F> for AggCircuit {
             &self.fixed_base_names,
             self.left_acc.clone(),
         )?;
-
-        let assigned_left_pi = if self.is_leaf {
-            vec![left_state.clone()]
-        } else {
-            let mut v = vec![vk_inner_pi.clone()];
-            v.push(left_state.clone());
-            v.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
-            v.push(prev_level.clone());
-            let hashed_value = poseidon_chip.hash(&mut layouter, &v)?;
-            vec![hashed_value]
-        };
-
-        let mut left_proof_acc = verifier_chip.prepare(
-            &mut layouter,
-            &assigned_vk,
-            &[("com_instance", id_point.clone())],
-            &[&assigned_left_pi],
-            self.left_proof.clone(),
-        )?;
-        left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
-        // Process right child
         let right_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
@@ -344,17 +282,109 @@ impl Circuit<F> for AggCircuit {
             self.right_acc.clone(),
         )?;
 
-        let assigned_right_pi = if self.is_leaf {
-            vec![right_state.clone()]
+        // VK selection and inner public inputs are handled differently
+        // for the leaf aggregation vs recursive aggregation circuits.
+        let (assigned_vk, vk_for_pi, assigned_left_pi, assigned_right_pi) = if self.is_leaf {
+            // -------------------------------------------------------------
+            // Leaf aggregation circuit: verify Poseidon proofs with poseidon_vk
+            // -------------------------------------------------------------
+            let assigned_vk = verifier_chip.assign_vk(
+                self.agg_vk_name,
+                &self.poseidon_vk.0,
+                &self.poseidon_vk.1,
+                poseidon_vk_val.clone(),
+            )?;
+
+            // Poseidon circuit has a single public input: its output state.
+            let assigned_left_pi = vec![left_state.clone()];
+            let assigned_right_pi = vec![right_state.clone()];
+
+            (
+                assigned_vk,
+                poseidon_vk_val.clone(),
+                assigned_left_pi,
+                assigned_right_pi,
+            )
         } else {
-            let mut v = vec![vk_inner_pi];
-            v.push(right_state.clone());
-            v.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
-            v.push(prev_level);
-            let hashed_value = poseidon_chip.hash(&mut layouter, &v)?;
-            vec![hashed_value]
+            // -------------------------------------------------------------
+            // Recursive aggregation circuit:
+            //   - leaf_agg vk is a constant in-circuit
+            //   - self-recursive agg vk is a witness
+            //   - we select in-circuit between poseidon / leaf_agg / agg vk
+            // -------------------------------------------------------------
+            let mut leaf_agg_vk_repr = F::ZERO;
+            self.leaf_agg_vk.2.map(|v| leaf_agg_vk_repr = v);
+            let leaf_vk_val: AssignedNative<F> =
+                native_chip.assign_fixed(&mut layouter, leaf_agg_vk_repr)?;
+
+            let agg_vk_val: AssignedNative<F> = native_chip.assign(&mut layouter, self.agg_vk.2)?;
+
+            // Select VK used by the partial verifier based on the current level:
+            //   prev_level == 0 -> poseidon vk
+            //   prev_level == 1 -> leaf_agg vk
+            //   prev_level >= 2 -> self-recursive agg vk
+            let vk_level_sel = native_chip.select(
+                &mut layouter,
+                &children_are_genesis,
+                &leaf_vk_val,
+                &agg_vk_val,
+            )?;
+            let vk_val =
+                native_chip.select(&mut layouter, &is_genesis, &poseidon_vk_val, &vk_level_sel)?;
+
+            // The assigned_vk is used in the partial verification gadget and
+            // directly affects the circuit shape. For the recursive agg case
+            // we feed in the in-circuit-selected vk representation.
+            let assigned_vk = verifier_chip.assign_vk(
+                self.agg_vk_name,
+                &self.agg_vk.0,
+                &self.agg_vk.1,
+                vk_val.clone(),
+            )?;
+
+            // Select inner VK public inputs based on the level "below":
+            //   prev_level == 1 -> poseidon vk
+            //   prev_level == 2 -> leaf_agg vk
+            //   prev_level >= 3 -> agg vk
+            let vk_inner_tmp = native_chip.select(
+                &mut layouter,
+                &children_are_genesis,
+                &poseidon_vk_val,
+                &agg_vk_val,
+            )?;
+            let vk_inner_pi =
+                native_chip.select(&mut layouter, &is_level_2, &leaf_vk_val, &vk_inner_tmp)?;
+
+            // Hash the child public inputs into a single field element
+            // which becomes the inner PI for this layer.
+            let mut left_pi_vec = vec![vk_inner_pi.clone()];
+            left_pi_vec.push(left_state.clone());
+            left_pi_vec.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
+            left_pi_vec.push(prev_level.clone());
+            let left_hash = poseidon_chip.hash(&mut layouter, &left_pi_vec)?;
+            let assigned_left_pi = vec![left_hash];
+
+            let mut right_pi_vec = vec![vk_inner_pi];
+            right_pi_vec.push(right_state.clone());
+            right_pi_vec.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
+            right_pi_vec.push(prev_level.clone());
+            let right_hash = poseidon_chip.hash(&mut layouter, &right_pi_vec)?;
+            let assigned_right_pi = vec![right_hash];
+
+            (assigned_vk, vk_val, assigned_left_pi, assigned_right_pi)
         };
 
+        // Process left child
+        let mut left_proof_acc = verifier_chip.prepare(
+            &mut layouter,
+            &assigned_vk,
+            &[("com_instance", id_point.clone())],
+            &[&assigned_left_pi],
+            self.left_proof.clone(),
+        )?;
+        left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+
+        // Process right child
         let mut right_proof_acc = verifier_chip.prepare(
             &mut layouter,
             &assigned_vk,
@@ -378,7 +408,7 @@ impl Circuit<F> for AggCircuit {
         // Hash the would-be public inputs (vk, state, acc, level) into a single public input
         let next_acc_pi = verifier_chip.as_public_input(&mut layouter, &next_acc)?;
         let mut hash_inputs = Vec::new();
-        hash_inputs.push(vk_val);
+        hash_inputs.push(vk_for_pi);
         hash_inputs.push(next_state);
         hash_inputs.extend(next_acc_pi);
         hash_inputs.push(next_level);
@@ -491,7 +521,7 @@ fn main() {
         poseidon_halo2_vk,
     ));
 
-    // Setup aggregation circuit
+    // Setup aggregation circuit constraint system
     let mut agg_cs = ConstraintSystem::default();
     configure_agg_circuit(&mut agg_cs);
     let agg_domain = EvaluationDomain::new(agg_cs.degree() as u32, K);
@@ -510,6 +540,36 @@ fn main() {
         v
     };
 
+    let agg_srs = filecoin_srs(K);
+
+    // First: leaf aggregation circuit (verifies Poseidon proofs with poseidon_vk)
+    let default_leaf_agg_circuit = AggCircuit {
+        agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
+        agg_vk_name: "poseidon_vk",
+        poseidon_vk: poseidon_vk_data.clone(),
+        left_state: Value::unknown(),
+        right_state: Value::unknown(),
+        left_proof: Value::unknown(),
+        right_proof: Value::unknown(),
+        left_acc: Value::unknown(),
+        right_acc: Value::unknown(),
+        fixed_base_names: combined_fixed_base_names_keygen.clone(),
+        is_leaf: true,
+        prev_level: Value::unknown(),
+        leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
+    };
+
+    let leaf_agg_vk = keygen_vk_with_k(&agg_srs, &default_leaf_agg_circuit, K).unwrap();
+    let leaf_agg_pk = keygen_pk(leaf_agg_vk.clone(), &default_leaf_agg_circuit).unwrap();
+    println!("Computed leaf AGG vk and pk");
+
+    let leaf_agg_vk_data = (
+        EvaluationDomain::new(leaf_agg_vk.cs().degree() as u32, K),
+        leaf_agg_vk.cs().clone(),
+        Value::known(leaf_agg_vk.transcript_repr()),
+    );
+
+    // Now: recursive aggregation circuit (can aggregate leaf_agg or itself)
     let default_agg_circuit = AggCircuit {
         agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
         agg_vk_name: "agg_vk",
@@ -523,24 +583,13 @@ fn main() {
         fixed_base_names: combined_fixed_base_names_keygen.clone(),
         is_leaf: false,
         prev_level: Value::unknown(),
-        leaf_agg_vk: (agg_domain.clone(), agg_cs.clone(), Value::unknown()),
+        leaf_agg_vk: leaf_agg_vk_data.clone(),
     };
 
-    let agg_srs = filecoin_srs(K);
     let start = Instant::now();
     let agg_vk = keygen_vk_with_k(&agg_srs, &default_agg_circuit, K).unwrap();
     let agg_pk = keygen_pk(agg_vk.clone(), &default_agg_circuit).unwrap();
     println!("Computed AGG vk and pk in {:?}", start.elapsed());
-
-    let default_leaf_agg_circuit = AggCircuit {
-        agg_vk_name: "poseidon_vk",
-        is_leaf: true,
-        ..default_agg_circuit.clone()
-    };
-
-    let leaf_agg_vk = keygen_vk_with_k(&agg_srs, &default_leaf_agg_circuit, K).unwrap();
-    let leaf_agg_pk = keygen_pk(leaf_agg_vk.clone(), &default_leaf_agg_circuit).unwrap();
-    println!("Computed leaf AGG vk and pk");
 
     let mut agg_fixed_bases = BTreeMap::new();
     agg_fixed_bases.insert(String::from("com_instance"), C::identity());
@@ -584,11 +633,6 @@ fn main() {
         Accumulator::accumulate(&[trivial_poseidon, trivial_leaf_agg, trivial_agg]);
     trivial_combined.collapse();
 
-    let leaf_agg_vk_data = (
-        EvaluationDomain::new(leaf_agg_vk.cs().degree() as u32, K),
-        leaf_agg_vk.cs().clone(),
-        Value::known(leaf_agg_vk.transcript_repr()),
-    );
     let agg_vk_data = (
         EvaluationDomain::new(agg_vk.cs().degree() as u32, K),
         agg_vk.cs().clone(),
