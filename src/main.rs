@@ -1,7 +1,7 @@
 use halo2curves::{ff::Field, group::Group};
 use midnight_circuits::compact_std_lib::MidnightCircuit;
 use midnight_circuits::hash::poseidon::PoseidonState;
-use midnight_circuits::types::{AssignedBit, AssignedForeignPoint};
+use midnight_circuits::types::AssignedForeignPoint;
 use midnight_circuits::{
     compact_std_lib::{self, Relation, ZkStdLib, ZkStdLibArch},
     ecc::{
@@ -59,7 +59,7 @@ const K: u32 = 20;
 const POSEIDON_K: u32 = 6;
 
 fn filecoin_srs(k: u32) -> ParamsKZG<Bls12> {
-    assert!(k <= 20, "We don't have an SRS for circuits of size {k}");
+    assert!(k <= 20, "We don't have an SRS for circuits of size {}", k);
     let srs_dir = env::var("SRS_DIR").unwrap_or("./examples/assets".into());
     let srs_path = format!("{srs_dir}/bls_filecoin_2p{k:?}");
     let mut fetching_path = srs_path.clone();
@@ -90,19 +90,6 @@ fn filecoin_srs(k: u32) -> ParamsKZG<Bls12> {
     }
 
     params
-}
-
-fn binary_select_vk(
-    layouter: &mut impl Layouter<F>,
-    native_chip: &NativeChip<F>,
-    vk_a: &[AssignedNative<F>],
-    vk_b: &[AssignedNative<F>],
-    bit: &AssignedBit<F>,
-) -> Result<Vec<AssignedNative<F>>, Error> {
-    assert_eq!(vk_a.len(), vk_b.len());
-    (0..vk_a.len())
-        .map(|i| native_chip.select(layouter, bit, &vk_a[i], &vk_b[i]))
-        .collect()
 }
 
 #[derive(Clone, Default)]
@@ -258,17 +245,26 @@ impl Circuit<F> for AggCircuit {
         let is_level_2 =
             scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
 
-        // Assign VKs
-        let poseidon_vk: AssignedNative<F> =
-            native_chip.assign(&mut layouter, self.poseidon_vk.2)?;
-        let leaf_agg_vk = native_chip.assign(&mut layouter, self.leaf_agg_vk.2)?;
-        let agg_vk = native_chip.assign(&mut layouter, self.agg_vk.2)?;
+        // Assign poseidon vk as constant
+        let mut poseidon_vk_repr = F::ZERO;
+        self.poseidon_vk.2.map(|v| poseidon_vk_repr = v);
 
-        // Select correct VK based on level
-        let vk_val =
-            native_chip.select(&mut layouter, &children_are_genesis, &leaf_agg_vk, &agg_vk)?;
-        let vk_val = native_chip.select(&mut layouter, &is_genesis, &poseidon_vk, &vk_val)?;
+        let poseidon_vk_val: AssignedNative<F> =
+            native_chip.assign_fixed(&mut layouter, poseidon_vk_repr)?;
+        let agg_vk_val: AssignedNative<F> = native_chip.assign(&mut layouter, self.agg_vk.2)?;
+        let leaf_vk_val: AssignedNative<F> =
+            native_chip.assign(&mut layouter, self.leaf_agg_vk.2)?;
 
+        // Select correct VK used in the partial verification gadget based on level
+        let vk_val = native_chip.select(
+            &mut layouter,
+            &children_are_genesis,
+            &leaf_vk_val,
+            &agg_vk_val,
+        )?;
+        let vk_val = native_chip.select(&mut layouter, &is_genesis, &poseidon_vk_val, &vk_val)?;
+
+        // The assigned_vk is used in the partial verification gadget and directly affects the circuit shape
         let assigned_vk = verifier_chip.assign_vk(
             self.agg_vk_name,
             if self.is_leaf {
@@ -283,40 +279,19 @@ impl Circuit<F> for AggCircuit {
             },
             vk_val.clone(),
         )?;
+        // assign VK as public input
         native_chip.constrain_as_public_input(&mut layouter, &vk_val)?;
 
-        // Assign inner VKs for public input selection
-        let assigned_vk_poseidon = verifier_chip.assign_vk(
-            "poseidon_vk",
-            &self.poseidon_vk.0,
-            &self.poseidon_vk.1,
-            poseidon_vk,
-        )?;
-        let assigned_vk_agg =
-            verifier_chip.assign_vk("agg_vk", &self.agg_vk.0, &self.agg_vk.1, agg_vk)?;
-        let assigned_vk_leaf_agg =
-            verifier_chip.assign_vk("agg_vk", &self.agg_vk.0, &self.agg_vk.1, leaf_agg_vk)?;
-
-        let poseidon_vk_elts =
-            verifier_chip.as_public_input(&mut layouter, &assigned_vk_poseidon)?;
-        let agg_vk_elts = verifier_chip.as_public_input(&mut layouter, &assigned_vk_agg)?;
-        let leaf_vk_elts = verifier_chip.as_public_input(&mut layouter, &assigned_vk_leaf_agg)?;
-
         // Select inner VK public inputs based on level
-        let vk_inner_pi = binary_select_vk(
+        let vk_inner_pi = native_chip.select(
             &mut layouter,
-            &native_chip,
-            &poseidon_vk_elts,
-            &agg_vk_elts,
             &children_are_genesis,
+            &poseidon_vk_val,
+            &agg_vk_val,
         )?;
-        let vk_inner_pi = binary_select_vk(
-            &mut layouter,
-            &native_chip,
-            &leaf_vk_elts,
-            &vk_inner_pi,
-            &is_level_2,
-        )?;
+
+        let vk_inner_pi =
+            native_chip.select(&mut layouter, &is_level_2, &leaf_vk_val, &vk_inner_pi)?;
 
         // Compute next state
         let left_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.left_state)?;
@@ -346,7 +321,7 @@ impl Circuit<F> for AggCircuit {
         let assigned_left_pi = if self.is_leaf {
             vec![left_state.clone()]
         } else {
-            let mut v = vk_inner_pi.clone();
+            let mut v = vec![vk_inner_pi.clone()];
             v.push(left_state.clone());
             v.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
             v.push(prev_level.clone());
@@ -377,7 +352,7 @@ impl Circuit<F> for AggCircuit {
         let assigned_right_pi = if self.is_leaf {
             vec![right_state.clone()]
         } else {
-            let mut v = vk_inner_pi;
+            let mut v = vec![vk_inner_pi];
             v.push(right_state.clone());
             v.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
             v.push(prev_level);
