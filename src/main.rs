@@ -236,11 +236,6 @@ impl Circuit<F> for AggCircuit {
         // Assign and compute level information
         let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
         let next_level = scalar_chip.add_constant(&mut layouter, &prev_level, F::ONE)?;
-        let is_genesis = scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::ZERO)?;
-        let children_are_genesis =
-            scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::ONE)?;
-        let is_level_2 =
-            scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
 
         // Poseidon vk transcript repr is a constant in both circuits
         let poseidon_vk_val: AssignedNative<F> =
@@ -252,14 +247,8 @@ impl Circuit<F> for AggCircuit {
         let next_state =
             poseidon_chip.hash(&mut layouter, &[left_state.clone(), right_state.clone()])?;
 
-        let id_point: AssignedForeignPoint<
-            midnight_curves::Fq,
-            midnight_curves::G1Projective,
-            midnight_curves::G1Projective,
-        > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
-
         // Assigned accumulators for children
-        let left_acc = AssignedAccumulator::assign(
+        let mut left_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
             &scalar_chip,
@@ -269,7 +258,7 @@ impl Circuit<F> for AggCircuit {
             &self.fixed_base_names,
             self.left_acc.clone(),
         )?;
-        let right_acc = AssignedAccumulator::assign(
+        let mut right_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
             &scalar_chip,
@@ -283,6 +272,27 @@ impl Circuit<F> for AggCircuit {
         // VK selection and inner public inputs are handled differently
         // for the leaf aggregation vs recursive aggregation circuits.
         let (assigned_vk, vk_for_pi, assigned_left_pi, assigned_right_pi) = if self.is_leaf {
+            // enforce prev_level == 0
+            scalar_chip.assert_equal_to_fixed(&mut layouter, &prev_level, F::ZERO)?;
+            let neutral_scaling_factor = scalar_chip.assign_fixed(&mut layouter, false)?;
+
+            // rescale to neutral accumulators by scaling by 0
+            AssignedAccumulator::scale_by_bit(
+                &mut layouter,
+                &scalar_chip,
+                &neutral_scaling_factor,
+                &mut left_acc,
+            )?;
+
+            AssignedAccumulator::scale_by_bit(
+                &mut layouter,
+                &scalar_chip,
+                &neutral_scaling_factor,
+                &mut right_acc,
+            )?;
+
+            left_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
+            right_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
             // -------------------------------------------------------------
             // Leaf aggregation circuit: verify Poseidon proofs with poseidon_vk
             // -------------------------------------------------------------
@@ -310,6 +320,14 @@ impl Circuit<F> for AggCircuit {
             //   - self-recursive agg vk is a witness
             //   - we select in-circuit between poseidon / leaf_agg / agg vk
             // -------------------------------------------------------------
+            // enforce prev_level >= 1
+            scalar_chip.assert_not_equal_to_fixed(&mut layouter, &prev_level, F::ZERO)?;
+
+            let children_are_genesis =
+                scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::ONE)?;
+            let is_level_2 =
+                scalar_chip.is_equal_to_fixed(&mut layouter, &prev_level, F::from(2u64))?;
+
             let mut leaf_agg_vk_repr = F::ZERO;
             self.leaf_agg_vk.2.map(|v| leaf_agg_vk_repr = v);
             let leaf_vk_val: AssignedNative<F> =
@@ -321,14 +339,12 @@ impl Circuit<F> for AggCircuit {
             //   prev_level == 0 -> poseidon vk
             //   prev_level == 1 -> leaf_agg vk
             //   prev_level >= 2 -> self-recursive agg vk
-            let vk_level_sel = native_chip.select(
+            let vk_val = native_chip.select(
                 &mut layouter,
                 &children_are_genesis,
                 &leaf_vk_val,
                 &agg_vk_val,
             )?;
-            let vk_val =
-                native_chip.select(&mut layouter, &is_genesis, &poseidon_vk_val, &vk_level_sel)?;
 
             // The assigned_vk is used in the partial verification gadget and
             // directly affects the circuit shape. For the recursive agg case
@@ -371,6 +387,12 @@ impl Circuit<F> for AggCircuit {
 
             (assigned_vk, vk_val, assigned_left_pi, assigned_right_pi)
         };
+
+        let id_point: AssignedForeignPoint<
+            midnight_curves::Fq,
+            midnight_curves::G1Projective,
+            midnight_curves::G1Projective,
+        > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
         // Process left child
         let mut left_proof_acc = verifier_chip.prepare(
