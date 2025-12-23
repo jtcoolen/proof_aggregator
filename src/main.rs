@@ -137,13 +137,9 @@ impl Relation for PoseidonExample {
 #[derive(Clone, Debug)]
 pub struct AggCircuit {
     // The VK *of the circuit verified at this layer* (i.e. children).
-    // We keep (domain, cs) for the verifier gadget and a fixed transcript repr for in-circuit VK PI hashing.
+    // We keep (domain, cs) for the verifier gadget and a fixed transcript repr for in-circuit assignment.
     child_vk: (EvaluationDomain<F>, ConstraintSystem<F>, F),
     child_vk_name: String,
-
-    // The VK repr that the *children* embedded in their own PI hash (i.e. their vk_for_pi).
-    // Unused when `is_leaf == true`.
-    inner_vk_repr: F,
 
     // Enforced `prev_level` value for this circuit variant (0 for leaf agg, >=1 for internal levels).
     expected_prev_level: F,
@@ -287,7 +283,7 @@ impl Circuit<F> for AggCircuit {
 
         // Compute the child public inputs expected by the verifier gadget.
         // - leaf agg: Poseidon circuit has PI = [state]
-        // - internal agg: child agg circuits have PI = [Hash(inner_vk_repr, state, acc_pi, level)]
+        // - internal agg: child agg circuits have PI = [state, acc_pi..., level]
         let (assigned_left_pi, assigned_right_pi) = if self.is_leaf {
             // For leaf aggregation, we want the provided PI accumulators to be "available for bases"
             // but not contribute to the MSM: scale them to neutral by multiplying by 0.
@@ -311,24 +307,15 @@ impl Circuit<F> for AggCircuit {
 
             (vec![left_state.clone()], vec![right_state.clone()])
         } else {
-            let inner_vk_pi: AssignedNative<F> =
-                native_chip.assign_fixed(&mut layouter, self.inner_vk_repr)?;
-
-            let mut left_pi_vec = vec![inner_vk_pi.clone()];
-            left_pi_vec.push(left_state.clone());
+            let mut left_pi_vec = vec![left_state.clone()];
             left_pi_vec.extend(verifier_chip.as_public_input(&mut layouter, &left_acc)?);
             left_pi_vec.push(prev_level.clone());
-            let left_hash = poseidon_chip.hash(&mut layouter, &left_pi_vec)?;
-            let assigned_left_pi = vec![left_hash];
 
-            let mut right_pi_vec = vec![inner_vk_pi];
-            right_pi_vec.push(right_state.clone());
+            let mut right_pi_vec = vec![right_state.clone()];
             right_pi_vec.extend(verifier_chip.as_public_input(&mut layouter, &right_acc)?);
             right_pi_vec.push(prev_level.clone());
-            let right_hash = poseidon_chip.hash(&mut layouter, &right_pi_vec)?;
-            let assigned_right_pi = vec![right_hash];
 
-            (assigned_left_pi, assigned_right_pi)
+            (left_pi_vec, right_pi_vec)
         };
 
         let id_point: AssignedForeignPoint<
@@ -367,18 +354,15 @@ impl Circuit<F> for AggCircuit {
         )?;
         next_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        // Hash the would-be public inputs (vk_for_pi, state, acc, level) into a single public input
-        // where vk_for_pi for this circuit is the *child VK repr*.
+        // Expose the *raw* public inputs (no hashing):
+        //   [state, acc_pi..., level]
         let next_acc_pi = verifier_chip.as_public_input(&mut layouter, &next_acc)?;
-        let mut hash_inputs = Vec::new();
-        hash_inputs.push(child_vk_val);
-        hash_inputs.push(next_state);
-        hash_inputs.extend(next_acc_pi);
-        hash_inputs.push(next_level);
-        let agg_pi_hash = poseidon_chip.hash(&mut layouter, &hash_inputs)?;
 
-        // Expose only the hash as a public input of the aggregation circuit
-        native_chip.constrain_as_public_input(&mut layouter, &agg_pi_hash)?;
+        native_chip.constrain_as_public_input(&mut layouter, &next_state)?;
+        for x in next_acc_pi.iter() {
+            native_chip.constrain_as_public_input(&mut layouter, x)?;
+        }
+        native_chip.constrain_as_public_input(&mut layouter, &next_level)?;
 
         core_decomp_chip.load(&mut layouter)
     }
@@ -452,18 +436,14 @@ fn verify_and_extract_acc(
     acc
 }
 
-// Off-circuit helper to hash the would-be public inputs (vk_for_pi, state, acc, level)
-// into a single field element that is used as the only public input of AggCircuit.
-fn agg_public_input_hash(vk_repr: F, state: F, acc: &Accumulator<S>, level: F) -> F {
-    use midnight_circuits::instructions::hash::HashCPU;
-
-    let mut inputs = Vec::new();
-    inputs.push(vk_repr);
-    inputs.push(state);
-    inputs.extend(AssignedAccumulator::as_public_input(acc));
-    inputs.push(level);
-
-    <PoseidonChip<F> as HashCPU<F, F>>::hash(&inputs)
+// Off-circuit helper to build the *raw* public inputs (no hashing):
+//   [state, acc_pi..., level]
+fn agg_public_inputs(state: F, acc: &Accumulator<S>, level: F) -> Vec<F> {
+    let mut out = Vec::new();
+    out.push(state);
+    out.extend(AssignedAccumulator::as_public_input(acc));
+    out.push(level);
+    out
 }
 
 fn agg_vk_name_for_level(level: usize) -> String {
@@ -506,7 +486,6 @@ fn main() {
     // -----------------------------
     let mut agg_cs = ConstraintSystem::default();
     configure_agg_circuit(&mut agg_cs);
-    let agg_domain: EvaluationDomain<F> = EvaluationDomain::new(agg_cs.degree() as u32, K);
     let agg_srs = filecoin_srs(K);
 
     // -----------------------------
@@ -549,11 +528,10 @@ fn main() {
         vec![None; max_level + 1];
 
     for level in 1..=max_level {
-        let (child_vk, child_vk_name, inner_vk_repr, expected_prev_level, is_leaf) = if level == 1 {
+        let (child_vk, child_vk_name, expected_prev_level, is_leaf) = if level == 1 {
             (
                 poseidon_vk_data.clone(),
                 "poseidon_vk".to_string(),
-                F::ZERO,
                 F::ZERO,
                 true,
             )
@@ -563,26 +541,12 @@ fn main() {
                 .expect("child agg vk_data missing")
                 .clone();
             let child_name = agg_vk_names[level - 2].clone(); // level-1 name is at index (level-2)
-
-            // inner_vk_repr is what the *child* circuit embedded as vk_for_pi in its own PI hash:
-            // - if child is level 1, it's poseidon_vk repr
-            // - if child is level >=2, it's the transcript repr of (level-2) circuit
-            let inner = if level == 2 {
-                poseidon_vk_data.2
-            } else {
-                agg_vk_data[level - 2]
-                    .as_ref()
-                    .expect("grandchild agg vk_data missing")
-                    .2
-            };
-
-            (child, child_name, inner, F::from((level as u64) - 1), false)
+            (child, child_name, F::from((level as u64) - 1), false)
         };
 
         let default_circuit = AggCircuit {
             child_vk,
             child_vk_name,
-            inner_vk_repr,
             expected_prev_level,
             left_state: Value::unknown(),
             right_state: Value::unknown(),
@@ -727,7 +691,6 @@ fn main() {
             let circuit = AggCircuit {
                 child_vk: poseidon_vk_data.clone(),
                 child_vk_name: "poseidon_vk".to_string(),
-                inner_vk_repr: F::ZERO,
                 expected_prev_level: F::ZERO,
                 left_state: Value::known(*left_state),
                 right_state: Value::known(*right_state),
@@ -763,10 +726,11 @@ fn main() {
             ]);
             accumulated_pi.collapse();
 
-            // Public input hash for level 1 uses vk_for_pi = poseidon vk repr, level = 1
-            let public_input_hash =
-                agg_public_input_hash(poseidon_vk_data.2, state, &accumulated_pi, F::ONE);
-            let public_inputs = vec![public_input_hash];
+            // Public inputs for level 1 (no hashing):
+            //   state     = Poseidon(left_state, right_state)
+            //   acc_pi... = accumulated_pi
+            //   level     = 1
+            let public_inputs = agg_public_inputs(state, &accumulated_pi, F::ONE);
 
             let start = Instant::now();
             let proof = {
@@ -833,17 +797,7 @@ fn main() {
         let parent_fixed_bases = fixed_bases_by_level[parent_level].as_ref().unwrap();
 
         let child_vk_data = agg_vk_data[child_level].as_ref().unwrap().clone();
-        let child_vk_repr = child_vk_data.2;
         let child_vk_name = agg_vk_names[child_level - 1].clone();
-
-        // inner_vk_repr is what the *child* circuit embedded as vk_for_pi
-        let inner_vk_repr = if child_level == 1 {
-            // child is level 1 => it verified poseidon
-            poseidon_vk_data.2
-        } else {
-            // child is >=2 => it verified (child_level-1)
-            agg_vk_data[child_level - 1].as_ref().unwrap().2
-        };
 
         let next_level: Vec<TreeNode> = (0..current_level.len() / 2)
             .map(|i| {
@@ -856,7 +810,6 @@ fn main() {
                 let circuit = AggCircuit {
                     child_vk: child_vk_data.clone(),
                     child_vk_name: child_vk_name.clone(),
-                    inner_vk_repr,
                     expected_prev_level: F::from(child_level as u64),
                     left_state: Value::known(left.state),
                     right_state: Value::known(right.state),
@@ -877,16 +830,12 @@ fn main() {
                 ]);
                 accumulated_pi.collapse();
 
-                // Public input hash for this parent node:
-                //   vk_for_pi = transcript repr of *child* circuit (level = child_level)
+                // Public inputs for this parent node (no hashing):
+                //   state     = Poseidon(left.state, right.state)
+                //   acc_pi... = accumulated_pi
                 //   level     = parent_level
-                let public_input_hash = agg_public_input_hash(
-                    child_vk_repr,
-                    state,
-                    &accumulated_pi,
-                    F::from(parent_level as u64),
-                );
-                let public_inputs = vec![public_input_hash];
+                let public_inputs =
+                    agg_public_inputs(state, &accumulated_pi, F::from(parent_level as u64));
 
                 let start = Instant::now();
                 let proof = {
