@@ -1,3 +1,8 @@
+// NOTE: Option B (NUMA-aware pools) requires adding these deps to Cargo.toml:
+//   crossbeam-channel = "0.5"
+//   core_affinity     = "0.8"
+// (rayon is already used)
+
 use halo2curves::{ff::Field, group::Group};
 use midnight_circuits::compact_std_lib::MidnightCircuit;
 use midnight_circuits::hash::poseidon::PoseidonState;
@@ -37,12 +42,18 @@ use midnight_proofs::{
     transcript::{CircuitTranscript, Transcript},
 };
 use rand::rngs::OsRng;
+
+use core_affinity::CoreId;
+use crossbeam_channel as channel;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 type S = BlstrsEmulation;
@@ -58,6 +69,107 @@ type Pk = ProvingKey<F, KZGCommitmentScheme<E>>;
 const K: u32 = 19;
 const K2: u32 = 20;
 const POSEIDON_K: u32 = 6;
+
+// -----------------------------
+// Option B: 8 concurrent proofs, NUMA-pinned pools (2 pools per NUMA node)
+// Your machine: 4 NUMA nodes × 36 cores each (per lscpu)
+// -----------------------------
+const NUMA_NODES: usize = 4;
+const CORES_PER_NUMA: usize = 36;
+const POOLS_PER_NUMA: usize = 2;
+// 2 * 18 = 36 (fills each NUMA node). Try 16 if bandwidth is the limiter.
+const THREADS_PER_PROOF: usize = 18;
+
+struct PinnedPool {
+    pool: ThreadPool,
+}
+
+fn build_option_b_pools() -> Vec<PinnedPool> {
+    assert!(THREADS_PER_PROOF * POOLS_PER_NUMA <= CORES_PER_NUMA);
+
+    let mut pools = Vec::with_capacity(NUMA_NODES * POOLS_PER_NUMA);
+
+    for numa in 0..NUMA_NODES {
+        let base = numa * CORES_PER_NUMA;
+
+        for p in 0..POOLS_PER_NUMA {
+            let start = base + p * THREADS_PER_PROOF;
+            let end = start + THREADS_PER_PROOF;
+            let cpu_list: Vec<usize> = (start..end).collect();
+
+            let cpu_list_for_handler = cpu_list.clone();
+
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(cpu_list.len())
+                .start_handler(move |thread_idx| {
+                    let cpu = cpu_list_for_handler[thread_idx % cpu_list_for_handler.len()];
+                    let _ = core_affinity::set_for_current(CoreId { id: cpu });
+                })
+                .build()
+                .expect("Failed to build Rayon pool");
+
+            pools.push(PinnedPool { pool });
+        }
+    }
+
+    pools
+}
+
+/// Run N jobs with limited concurrency = pools.len().
+/// Each job runs inside a pinned Rayon pool via `pool.install(|| ...)`, so Halo2’s internal Rayon
+/// parallelism stays effective (and localized).
+fn map_with_pools<T, E, FJob>(pools: &[PinnedPool], n: usize, job: FJob) -> Result<Vec<T>, E>
+where
+    T: Send,
+    E: Send,
+    FJob: Fn(usize) -> Result<T, E> + Sync,
+{
+    if n == 0 {
+        return Ok(vec![]);
+    }
+
+    let (tx_job, rx_job) = channel::unbounded::<usize>();
+    let (tx_res, rx_res) = channel::unbounded::<(usize, Result<T, E>)>();
+
+    for i in 0..n {
+        tx_job.send(i).unwrap();
+    }
+    drop(tx_job);
+
+    thread::scope(|scope| {
+        for pool in pools.iter() {
+            let rx_job = rx_job.clone();
+            let tx_res = tx_res.clone();
+            let pool_ref = &pool.pool;
+            let job_ref = &job;
+
+            scope.spawn(move || {
+                while let Ok(i) = rx_job.recv() {
+                    let r = pool_ref.install(|| job_ref(i));
+                    let _ = tx_res.send((i, r));
+                }
+            });
+        }
+    });
+
+    drop(tx_res);
+
+    let mut out: Vec<Option<Result<T, E>>> = Vec::with_capacity(n);
+    out.resize_with(n, || None);
+    for _ in 0..n {
+        let (i, r) = rx_res.recv().unwrap();
+        out[i] = Some(r);
+    }
+
+    let mut final_out = Vec::with_capacity(n);
+    for item in out {
+        match item.expect("missing result") {
+            Ok(v) => final_out.push(v),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(final_out)
+}
 
 fn io_other(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::Other, msg.into())
@@ -89,7 +201,6 @@ fn filecoin_srs(k: u32) -> Result<ParamsKZG<Bls12>, std::io::Error> {
 
     let mut params: ParamsKZG<Bls12> = ParamsKZG::read_custom::<_>(
         &mut BufReader::new(params_fs),
-        // Kept as-is, but error-handled. If you can use a checked format, prefer it.
         SerdeFormat::RawBytesUnchecked,
     )
     .map_err(|e| {
@@ -171,12 +282,8 @@ impl Relation for PoseidonExample {
 
 #[derive(Clone, Debug)]
 pub struct AggCircuit {
-    // The VK *of the circuit verified at this layer* (i.e. children).
-    // We keep (domain, cs) for the verifier gadget and a fixed transcript repr for in-circuit assignment.
     child_vk: VkData,
     child_vk_name: String,
-
-    // Enforced `prev_level` value for this circuit variant (0 for leaf agg, >=1 for internal levels).
     expected_prev_level: F,
 
     left_state: Value<F>,
@@ -192,12 +299,8 @@ pub struct AggCircuit {
 
 #[derive(Clone, Debug)]
 pub struct AggCircuit2 {
-    // The VK *of the circuit verified at this layer* (i.e. children).
-    // We keep (domain, cs) for the verifier gadget and a fixed transcript repr for in-circuit assignment.
     child_vk: VkData,
     child_vk_name: String,
-
-    // Enforced `prev_level` value for this circuit variant (0 for leaf agg, >=1 for internal levels).
     expected_prev_level: F,
 
     left_state: Value<F>,
@@ -300,22 +403,18 @@ impl Circuit<F> for AggCircuit {
         let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
         let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
-        // Enforce expected level and compute next level
         let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
         scalar_chip.assert_equal_to_fixed(&mut layouter, &prev_level, self.expected_prev_level)?;
         let next_level = scalar_chip.add_constant(&mut layouter, &prev_level, F::ONE)?;
 
-        // Child VK transcript representation is a fixed constant in-circuit for this layer
         let child_vk_val: AssignedNative<F> =
             native_chip.assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
 
-        // Compute next state (Poseidon over children states)
         let left_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.left_state)?;
         let right_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.right_state)?;
         let next_state =
             poseidon_chip.hash(&mut layouter, &[left_state.clone(), right_state.clone()])?;
 
-        // Assigned accumulators for children (these are *PI accumulators* provided as witnesses)
         let mut left_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
@@ -337,7 +436,6 @@ impl Circuit<F> for AggCircuit {
             self.right_acc.clone(),
         )?;
 
-        // VK used by the partial verifier at this layer (always the "child_vk" of this layer)
         let assigned_vk = verifier_chip.assign_vk(
             self.child_vk_name.as_str(),
             &self.child_vk.domain,
@@ -345,12 +443,7 @@ impl Circuit<F> for AggCircuit {
             child_vk_val.clone(),
         )?;
 
-        // Compute the child public inputs expected by the verifier gadget.
-        // - leaf agg: Poseidon circuit has PI = [state]
-        // - internal agg: child agg circuits have PI = [state, acc_pi..., level]
         let (assigned_left_pi, assigned_right_pi) = if self.is_leaf {
-            // For leaf aggregation, we want the provided PI accumulators to be "available for bases"
-            // but not contribute to the MSM: scale them to neutral by multiplying by 0.
             let neutral_scaling_factor = scalar_chip.assign_fixed(&mut layouter, false)?;
 
             AssignedAccumulator::scale_by_bit(
@@ -388,7 +481,6 @@ impl Circuit<F> for AggCircuit {
             midnight_curves::G1Projective,
         > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
-        // Process left child
         let mut left_proof_acc = verifier_chip.prepare(
             &mut layouter,
             &assigned_vk,
@@ -398,7 +490,6 @@ impl Circuit<F> for AggCircuit {
         )?;
         left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        // Process right child
         let mut right_proof_acc = verifier_chip.prepare(
             &mut layouter,
             &assigned_vk,
@@ -408,7 +499,6 @@ impl Circuit<F> for AggCircuit {
         )?;
         right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        // Accumulate and output
         let mut next_acc = AssignedAccumulator::<S>::accumulate(
             &mut layouter,
             &verifier_chip,
@@ -418,8 +508,6 @@ impl Circuit<F> for AggCircuit {
         )?;
         next_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        // Expose the *raw* public inputs (no hashing):
-        //   [state, acc_pi..., level]
         let next_acc_pi = verifier_chip.as_public_input(&mut layouter, &next_acc)?;
 
         native_chip.constrain_as_public_input(&mut layouter, &next_state)?;
@@ -462,22 +550,18 @@ impl Circuit<F> for AggCircuit2 {
         let poseidon_chip = PoseidonChip::new(&config.3, &native_chip);
         let verifier_chip = VerifierGadget::new(&curve_chip, &scalar_chip, &poseidon_chip);
 
-        // Enforce expected level and compute next level
         let prev_level = scalar_chip.assign(&mut layouter, self.prev_level)?;
         scalar_chip.assert_equal_to_fixed(&mut layouter, &prev_level, self.expected_prev_level)?;
         let next_level = scalar_chip.add_constant(&mut layouter, &prev_level, F::ONE)?;
 
-        // Child VK transcript representation is a fixed constant in-circuit for this layer
         let child_vk_val: AssignedNative<F> =
             native_chip.assign_fixed(&mut layouter, self.child_vk.transcript_repr)?;
 
-        // Compute next state (Poseidon over children states)
         let left_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.left_state)?;
         let right_state: AssignedNative<F> = scalar_chip.assign(&mut layouter, self.right_state)?;
         let next_state =
             poseidon_chip.hash(&mut layouter, &[left_state.clone(), right_state.clone()])?;
 
-        // Assigned accumulators for children (these are *PI accumulators* provided as witnesses)
         let mut left_acc = AssignedAccumulator::assign(
             &mut layouter,
             &curve_chip,
@@ -499,7 +583,6 @@ impl Circuit<F> for AggCircuit2 {
             self.right_acc.clone(),
         )?;
 
-        // VK used by the partial verifier at this layer (always the "child_vk" of this layer)
         let assigned_vk = verifier_chip.assign_vk(
             self.child_vk_name.as_str(),
             &self.child_vk.domain,
@@ -507,12 +590,7 @@ impl Circuit<F> for AggCircuit2 {
             child_vk_val.clone(),
         )?;
 
-        // Compute the child public inputs expected by the verifier gadget.
-        // - leaf agg: Poseidon circuit has PI = [state]
-        // - internal agg: child agg circuits have PI = [state, acc_pi..., level]
         let (assigned_left_pi, assigned_right_pi) = if self.is_leaf {
-            // For leaf aggregation, we want the provided PI accumulators to be "available for bases"
-            // but not contribute to the MSM: scale them to neutral by multiplying by 0.
             let neutral_scaling_factor = scalar_chip.assign_fixed(&mut layouter, false)?;
 
             AssignedAccumulator::scale_by_bit(
@@ -550,7 +628,6 @@ impl Circuit<F> for AggCircuit2 {
             midnight_curves::G1Projective,
         > = curve_chip.assign_fixed(&mut layouter, C::identity())?;
 
-        // Process left child
         let mut left_proof_acc = verifier_chip.prepare(
             &mut layouter,
             &assigned_vk,
@@ -560,7 +637,6 @@ impl Circuit<F> for AggCircuit2 {
         )?;
         left_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        // Process right child
         let mut right_proof_acc = verifier_chip.prepare(
             &mut layouter,
             &assigned_vk,
@@ -570,7 +646,6 @@ impl Circuit<F> for AggCircuit2 {
         )?;
         right_proof_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        // Accumulate and output
         let mut next_acc = AssignedAccumulator::<S>::accumulate(
             &mut layouter,
             &verifier_chip,
@@ -580,8 +655,6 @@ impl Circuit<F> for AggCircuit2 {
         )?;
         next_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
 
-        // Expose the *raw* public inputs (no hashing):
-        //   [state, acc_pi..., level]
         let next_acc_pi = verifier_chip.as_public_input(&mut layouter, &next_acc)?;
 
         native_chip.constrain_as_public_input(&mut layouter, &next_state)?;
@@ -671,8 +744,6 @@ fn verify_and_extract_acc(
     Ok(acc)
 }
 
-// Off-circuit helper to build the *raw* public inputs (no hashing):
-//   [state, acc_pi..., level]
 fn agg_public_inputs(state: F, acc: &Accumulator<S>, level: F) -> Vec<F> {
     let mut out = Vec::new();
     out.push(state);
@@ -682,8 +753,6 @@ fn agg_public_inputs(state: F, acc: &Accumulator<S>, level: F) -> Vec<F> {
 }
 
 fn agg_vk_name_for_level(level: usize) -> String {
-    // Level 1 is the leaf-aggregation circuit (verifies Poseidon proofs).
-    // Level >=2 are internal aggregation circuits (each verifies the previous level circuit).
     format!("agg_vk_lvl{}", level)
 }
 
@@ -733,7 +802,6 @@ impl AggKeyStore {
         if levels.is_empty() {
             return Err(io_other("AggKeyStore cannot be empty"));
         }
-        // Ensure sequential levels and unique names.
         let mut seen_names = BTreeSet::new();
         for (i, lvl) in levels.iter().enumerate() {
             let expected_level = i + 1;
@@ -770,6 +838,14 @@ impl AggKeyStore {
 }
 
 fn main() -> Result<(), std::io::Error> {
+    // Build NUMA-pinned pools once and reuse for all recursion layers.
+    let pools = build_option_b_pools();
+    println!(
+        "Option B enabled: {} pools × {} threads/proof",
+        pools.len(),
+        THREADS_PER_PROOF
+    );
+
     // -----------------------------
     // Parameters / tree shape
     // -----------------------------
@@ -777,7 +853,7 @@ fn main() -> Result<(), std::io::Error> {
     if !num_leaves.is_power_of_two() {
         return Err(io_other("num_leaves must be a power of two"));
     }
-    let max_level: usize = (num_leaves as u32).trailing_zeros() as usize; // e.g. 8 -> 3 levels
+    let max_level: usize = (num_leaves as u32).trailing_zeros() as usize;
     if max_level == 0 {
         return Err(io_other("max_level computed as 0 (unexpected)"));
     }
@@ -823,13 +899,12 @@ fn main() -> Result<(), std::io::Error> {
     );
 
     // -----------------------------
-    // Precompute all AGG vk names (one per recursion layer)
+    // Precompute all AGG vk names
     // -----------------------------
     let agg_vk_names: Vec<String> = (1..=max_level).map(agg_vk_name_for_level).collect();
 
     // -----------------------------
-    // Build a *global* fixed base name list that includes Poseidon + every AGG level vk_name.
-    // This avoids collisions because each level has a distinct vk_name prefix.
+    // Build combined fixed base name list
     // -----------------------------
     let combined_fixed_base_names: Vec<String> = {
         let mut set = BTreeSet::new();
@@ -853,8 +928,7 @@ fn main() -> Result<(), std::io::Error> {
     };
 
     // -----------------------------
-    // Keygen one AGG VK/PK per level, each using a distinct vk_name (=> distinct fixed-base keys)
-    // Robust VK handling: store per-level material in AggKeyStore.
+    // Keygen one AGG VK/PK per level
     // -----------------------------
     let mut agg_levels: Vec<AggLevelKeys> = Vec::with_capacity(max_level);
 
@@ -875,25 +949,23 @@ fn main() -> Result<(), std::io::Error> {
                 })?
                 .vk_data
                 .clone();
-            let child_name = agg_vk_names[child_level - 1].clone(); // level-1 name at index level-2 => here child_level-1
+            let child_name = agg_vk_names[child_level - 1].clone();
             (child, child_name, F::from((level as u64) - 1), false)
         };
 
-        let default_circuit1 = {
-            AggCircuit {
-                child_vk: child_vk.clone(),
-                child_vk_name: child_vk_name.clone(),
-                expected_prev_level,
-                left_state: Value::unknown(),
-                right_state: Value::unknown(),
-                left_proof: Value::unknown(),
-                right_proof: Value::unknown(),
-                left_acc: Value::unknown(),
-                right_acc: Value::unknown(),
-                fixed_base_names: combined_fixed_base_names.clone(),
-                prev_level: Value::unknown(),
-                is_leaf,
-            }
+        let default_circuit1 = AggCircuit {
+            child_vk: child_vk.clone(),
+            child_vk_name: child_vk_name.clone(),
+            expected_prev_level,
+            left_state: Value::unknown(),
+            right_state: Value::unknown(),
+            left_proof: Value::unknown(),
+            right_proof: Value::unknown(),
+            left_acc: Value::unknown(),
+            right_acc: Value::unknown(),
+            fixed_base_names: combined_fixed_base_names.clone(),
+            prev_level: Value::unknown(),
+            is_leaf,
         };
         let default_circuit2 = AggCircuit2 {
             child_vk,
@@ -930,7 +1002,6 @@ fn main() -> Result<(), std::io::Error> {
         };
 
         let name = agg_vk_names[level - 1].clone();
-
         println!("Computed {} vk/pk in {:?}", name, start.elapsed());
 
         agg_levels.push(AggLevelKeys::new(level, name, vk, pk));
@@ -952,7 +1023,7 @@ fn main() -> Result<(), std::io::Error> {
     }
 
     // -----------------------------
-    // Build a "global trivial" accumulator carrying fixed bases for *all* circuits (no collisions)
+    // Build "global trivial" accumulator
     // -----------------------------
     let trivial_poseidon =
         trivial_acc_with_names(&fixed_base_names_for("poseidon_vk", &poseidon_vk_data.cs));
@@ -960,7 +1031,6 @@ fn main() -> Result<(), std::io::Error> {
     let mut trivial_all: Vec<Accumulator<S>> = vec![trivial_poseidon];
     for level in 1..=agg_store.max_level() {
         let vk_name = agg_store.get(level)?.name.as_str();
-        // CS degree should be identical across agg levels; still read from the concrete VK for safety.
         let cs = agg_store.get(level)?.vk.cs();
         let t = trivial_acc_with_names(&fixed_base_names_for(vk_name, cs));
         trivial_all.push(t);
@@ -1015,7 +1085,7 @@ fn main() -> Result<(), std::io::Error> {
         .collect::<Result<_, _>>()?;
 
     // -----------------------------
-    // Create leaf aggregation layer (AGG level 1, verifies Poseidon proofs)
+    // Create leaf aggregation layer (AGG level 1)
     // -----------------------------
     println!("\nCreating {} leaf AGG nodes...", num_leaves / 2);
 
@@ -1023,108 +1093,109 @@ fn main() -> Result<(), std::io::Error> {
     let leaf_keys = agg_store.get(leaf_level)?;
     let leaf_agg_vk_name = leaf_keys.name.clone();
 
-    let mut current_level: Vec<TreeNode> = (0..num_leaves / 2)
-        .map(|i| {
-            use midnight_circuits::instructions::hash::HashCPU;
+    // Option B: replace outer par_iter with pool-limited execution
+    let mut current_level: Vec<TreeNode> = map_with_pools(&pools, num_leaves / 2, |i| {
+        use midnight_circuits::instructions::hash::HashCPU;
 
-            let (left_state, _, left_proof) = &poseidon_proofs[i * 2];
-            let (right_state, _, right_proof) = &poseidon_proofs[i * 2 + 1];
+        let (left_state, _, left_proof) = &poseidon_proofs[i * 2];
+        let (right_state, _, right_proof) = &poseidon_proofs[i * 2 + 1];
 
-            let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[*left_state, *right_state]);
+        let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[*left_state, *right_state]);
 
-            let circuit = AggCircuit {
-                child_vk: poseidon_vk_data.clone(),
-                child_vk_name: "poseidon_vk".to_string(),
-                expected_prev_level: F::ZERO,
-                left_state: Value::known(*left_state),
-                right_state: Value::known(*right_state),
-                left_proof: Value::known(left_proof.clone()),
-                right_proof: Value::known(right_proof.clone()),
-                left_acc: Value::known(trivial_combined.clone()),
-                right_acc: Value::known(trivial_combined.clone()),
-                fixed_base_names: combined_fixed_base_names.clone(),
-                is_leaf: true,
-                prev_level: Value::known(F::ZERO),
-            };
+        let circuit = AggCircuit {
+            child_vk: poseidon_vk_data.clone(),
+            child_vk_name: "poseidon_vk".to_string(),
+            expected_prev_level: F::ZERO,
+            left_state: Value::known(*left_state),
+            right_state: Value::known(*right_state),
+            left_proof: Value::known(left_proof.clone()),
+            right_proof: Value::known(right_proof.clone()),
+            left_acc: Value::known(trivial_combined.clone()),
+            right_acc: Value::known(trivial_combined.clone()),
+            fixed_base_names: combined_fixed_base_names.clone(),
+            is_leaf: true,
+            prev_level: Value::known(F::ZERO),
+        };
 
-            let proof_acc_left = verify_and_extract_acc(
-                &poseidon_srs,
-                poseidon_vk.vk(),
-                &poseidon_fixed_bases,
-                left_proof,
-                &[*left_state],
-            )?;
-            let proof_acc_right = verify_and_extract_acc(
-                &poseidon_srs,
-                poseidon_vk.vk(),
-                &poseidon_fixed_bases,
-                right_proof,
-                &[*right_state],
-            )?;
+        let proof_acc_left = verify_and_extract_acc(
+            &poseidon_srs,
+            poseidon_vk.vk(),
+            &poseidon_fixed_bases,
+            left_proof,
+            &[*left_state],
+        )?;
+        let proof_acc_right = verify_and_extract_acc(
+            &poseidon_srs,
+            poseidon_vk.vk(),
+            &poseidon_fixed_bases,
+            right_proof,
+            &[*right_state],
+        )?;
 
-            let mut accumulated_pi = Accumulator::accumulate(&[
-                proof_acc_left,
-                trivial_combined.clone(),
-                proof_acc_right,
-                trivial_combined.clone(),
-            ]);
-            accumulated_pi.collapse();
+        let mut accumulated_pi = Accumulator::accumulate(&[
+            proof_acc_left,
+            trivial_combined.clone(),
+            proof_acc_right,
+            trivial_combined.clone(),
+        ]);
+        accumulated_pi.collapse();
 
-            // Public inputs for level 1 (no hashing):
-            //   state     = Poseidon(left_state, right_state)
-            //   acc_pi... = accumulated_pi
-            //   level     = 1
-            let public_inputs = agg_public_inputs(state, &accumulated_pi, F::ONE);
+        let public_inputs = agg_public_inputs(state, &accumulated_pi, F::ONE);
 
-            let start = Instant::now();
-            let proof = {
-                let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
-                create_proof::<F, KZGCommitmentScheme<E>, CircuitTranscript<PoseidonState<F>>, AggCircuit>(
-                    &agg_srs1,
-                    leaf_keys.pk.as_ref(),
-                    &[circuit],
-                    1,
-                    &[&[&[], &public_inputs]],
-                    OsRng,
-                    &mut transcript,
-                )
-                .map_err(|e| io_other(format!("Leaf AGG proof failed for node {i}: {e:?}")))?;
-                transcript.finalize()
-            };
-            println!(
-                "Leaf AGG {} ({}) created in {:?}",
-                i,
-                leaf_agg_vk_name,
-                start.elapsed()
-            );
-
-            if !accumulated_pi.check(&agg_srs2.s_g2().into(), &combined_fixed_bases) {
-                return Err(io_other(format!(
-                    "Leaf node {i}: accumulated PI accumulator did not check against combined fixed bases"
-                )));
-            }
-
-            let proof_acc = verify_and_extract_acc(
+        let start = Instant::now();
+        let proof = {
+            let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
+            create_proof::<
+                F,
+                KZGCommitmentScheme<E>,
+                CircuitTranscript<PoseidonState<F>>,
+                AggCircuit,
+            >(
                 &agg_srs1,
-                leaf_keys.vk.as_ref(),
-                &leaf_keys.fixed_bases,
-                &proof,
-                &public_inputs,
-            )?;
+                leaf_keys.pk.as_ref(),
+                &[circuit],
+                1,
+                &[&[&[], &public_inputs]],
+                OsRng,
+                &mut transcript,
+            )
+            .map_err(|e| io_other(format!("Leaf AGG proof failed for node {i}: {e:?}")))?;
+            transcript.finalize()
+        };
 
-            Ok::<_, std::io::Error>(TreeNode {
-                state,
-                proof,
-                proof_acc,
-                pi_acc: accumulated_pi,
-            })
+        println!(
+            "Leaf AGG {} ({}) created in {:?}",
+            i,
+            leaf_agg_vk_name,
+            start.elapsed()
+        );
+
+        if !accumulated_pi.check(&agg_srs2.s_g2().into(), &combined_fixed_bases) {
+            return Err(io_other(format!(
+                "Leaf node {i}: accumulated PI accumulator did not check against combined fixed bases"
+            )));
+        }
+
+        let proof_acc = verify_and_extract_acc(
+            &agg_srs1,
+            leaf_keys.vk.as_ref(),
+            &leaf_keys.fixed_bases,
+            &proof,
+            &public_inputs,
+        )?;
+
+        Ok::<_, std::io::Error>(TreeNode {
+            state,
+            proof,
+            proof_acc,
+            pi_acc: accumulated_pi,
         })
-        .collect::<Result<_, _>>()?;
+    })?;
 
     // -----------------------------
-    // Build internal layers: each layer L uses its own vk_name and verifies layer L-1
+    // Build internal layers
     // -----------------------------
-    let mut child_level: usize = 1; // current nodes are at AGG level 1
+    let mut child_level: usize = 1;
     while current_level.len() > 1 {
         let parent_level = child_level + 1;
         let parent_keys = agg_store.get(parent_level)?;
@@ -1141,99 +1212,94 @@ fn main() -> Result<(), std::io::Error> {
         let child_vk_data = child_keys.vk_data.clone();
         let child_vk_name = child_keys.name.clone();
 
-        let next_level: Vec<TreeNode> = (0..current_level.len() / 2)
-            .map(|i| {
-                use midnight_circuits::instructions::hash::HashCPU;
+        let next_level: Vec<TreeNode> = map_with_pools(&pools, current_level.len() / 2, |i| {
+            use midnight_circuits::instructions::hash::HashCPU;
 
-                let left = &current_level[i * 2];
-                let right = &current_level[i * 2 + 1];
+            let left = &current_level[i * 2];
+            let right = &current_level[i * 2 + 1];
 
-                let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[left.state, right.state]);
+            let state = <PoseidonChip<F> as HashCPU<F, F>>::hash(&[left.state, right.state]);
 
-                let circuit = AggCircuit2 {
-                    child_vk: child_vk_data.clone(),
-                    child_vk_name: child_vk_name.clone(),
-                    expected_prev_level: F::from(child_level as u64),
-                    left_state: Value::known(left.state),
-                    right_state: Value::known(right.state),
-                    left_proof: Value::known(left.proof.clone()),
-                    right_proof: Value::known(right.proof.clone()),
-                    left_acc: Value::known(left.pi_acc.clone()),
-                    right_acc: Value::known(right.pi_acc.clone()),
-                    fixed_base_names: combined_fixed_base_names.clone(),
-                    is_leaf: false,
-                    prev_level: Value::known(F::from(child_level as u64)),
-                };
+            let circuit = AggCircuit2 {
+                child_vk: child_vk_data.clone(),
+                child_vk_name: child_vk_name.clone(),
+                expected_prev_level: F::from(child_level as u64),
+                left_state: Value::known(left.state),
+                right_state: Value::known(right.state),
+                left_proof: Value::known(left.proof.clone()),
+                right_proof: Value::known(right.proof.clone()),
+                left_acc: Value::known(left.pi_acc.clone()),
+                right_acc: Value::known(right.pi_acc.clone()),
+                fixed_base_names: combined_fixed_base_names.clone(),
+                is_leaf: false,
+                prev_level: Value::known(F::from(child_level as u64)),
+            };
 
-                let mut accumulated_pi = Accumulator::accumulate(&[
-                    left.proof_acc.clone(),
-                    left.pi_acc.clone(),
-                    right.proof_acc.clone(),
-                    right.pi_acc.clone(),
-                ]);
-                accumulated_pi.collapse();
+            let mut accumulated_pi = Accumulator::accumulate(&[
+                left.proof_acc.clone(),
+                left.pi_acc.clone(),
+                right.proof_acc.clone(),
+                right.pi_acc.clone(),
+            ]);
+            accumulated_pi.collapse();
 
-                // Public inputs for this parent node (no hashing):
-                //   state     = Poseidon(left.state, right.state)
-                //   acc_pi... = accumulated_pi
-                //   level     = parent_level
-                let public_inputs =
-                    agg_public_inputs(state, &accumulated_pi, F::from(parent_level as u64));
+            let public_inputs =
+                agg_public_inputs(state, &accumulated_pi, F::from(parent_level as u64));
 
-                let start = Instant::now();
-                let proof = {
-                    let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
-                    create_proof::<
-                        F,
-                        KZGCommitmentScheme<E>,
-                        CircuitTranscript<PoseidonState<F>>,
-                        AggCircuit2,
-                    >(
-                        &agg_srs2,
-                        parent_keys.pk.as_ref(),
-                        &[circuit],
-                        1,
-                        &[&[&[], &public_inputs]],
-                        OsRng,
-                        &mut transcript,
-                    )
-                    .map_err(|e| {
-                        io_other(format!(
-                            "Internal AGG proof failed at level {parent_level}, node {i}: {e:?}"
-                        ))
-                    })?;
-                    transcript.finalize()
-                };
-                println!(
-                    "Level {} node {} ({}) created in {:?}",
-                    parent_level,
-                    i,
-                    parent_vk_name,
-                    start.elapsed()
-                );
-
-                if !accumulated_pi.check(&agg_srs2.s_g2().into(), &combined_fixed_bases) {
-                    return Err(io_other(format!(
-                        "Level {parent_level} node {i}: accumulated PI accumulator did not check against combined fixed bases"
-                    )));
-                }
-
-                let proof_acc = verify_and_extract_acc(
+            let start = Instant::now();
+            let proof = {
+                let mut transcript = CircuitTranscript::<PoseidonState<F>>::init();
+                create_proof::<
+                    F,
+                    KZGCommitmentScheme<E>,
+                    CircuitTranscript<PoseidonState<F>>,
+                    AggCircuit2,
+                >(
                     &agg_srs2,
-                    parent_keys.vk.as_ref(),
-                    &parent_keys.fixed_bases,
-                    &proof,
-                    &public_inputs,
-                )?;
+                    parent_keys.pk.as_ref(),
+                    &[circuit],
+                    1,
+                    &[&[&[], &public_inputs]],
+                    OsRng,
+                    &mut transcript,
+                )
+                .map_err(|e| {
+                    io_other(format!(
+                        "Internal AGG proof failed at level {parent_level}, node {i}: {e:?}"
+                    ))
+                })?;
+                transcript.finalize()
+            };
 
-                Ok::<_, std::io::Error>(TreeNode {
-                    state,
-                    proof,
-                    proof_acc,
-                    pi_acc: accumulated_pi,
-                })
+            println!(
+                "Level {} node {} ({}) created in {:?}",
+                parent_level,
+                i,
+                parent_vk_name,
+                start.elapsed()
+            );
+
+            if !accumulated_pi.check(&agg_srs2.s_g2().into(), &combined_fixed_bases) {
+                return Err(io_other(format!(
+                    "Level {parent_level} node {i}: accumulated PI accumulator did not check against combined fixed bases"
+                )));
+            }
+
+            let proof_acc = verify_and_extract_acc(
+                &agg_srs2,
+                parent_keys.vk.as_ref(),
+                &parent_keys.fixed_bases,
+                &proof,
+                &public_inputs,
+            )?;
+
+            Ok::<_, std::io::Error>(TreeNode {
+                state,
+                proof,
+                proof_acc,
+                pi_acc: accumulated_pi,
             })
-            .collect::<Result<_, _>>()?;
+        })?;
 
         current_level = next_level;
         child_level = parent_level;
