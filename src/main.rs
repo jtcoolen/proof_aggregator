@@ -71,53 +71,97 @@ const K2: u32 = 20;
 const POSEIDON_K: u32 = 6;
 
 // -----------------------------
-// Option B: 8 concurrent proofs, NUMA-pinned pools (2 pools per NUMA node)
+// Option B (adaptive): pool sets for 8/4/2/1 concurrent proofs.
 // Your machine: 4 NUMA nodes × 36 cores each (per lscpu)
 // -----------------------------
 const NUMA_NODES: usize = 4;
 const CORES_PER_NUMA: usize = 36;
-const POOLS_PER_NUMA: usize = 2;
-// 2 * 18 = 36 (fills each NUMA node). Try 16 if bandwidth is the limiter.
-const THREADS_PER_PROOF: usize = 18;
+const TOTAL_CORES: usize = NUMA_NODES * CORES_PER_NUMA;
 
 struct PinnedPool {
     pool: ThreadPool,
+    threads: usize,
 }
 
-fn build_option_b_pools() -> Vec<PinnedPool> {
-    assert!(THREADS_PER_PROOF * POOLS_PER_NUMA <= CORES_PER_NUMA);
+struct PoolSets {
+    pools_8: Vec<PinnedPool>, // 8 pools × 18 threads
+    pools_4: Vec<PinnedPool>, // 4 pools × 36 threads
+    pools_2: Vec<PinnedPool>, // 2 pools × 72 threads
+    pools_1: Vec<PinnedPool>, // 1 pool  × 144 threads
+}
 
-    let mut pools = Vec::with_capacity(NUMA_NODES * POOLS_PER_NUMA);
+fn build_pinned_pool(cpu_list: Vec<usize>) -> PinnedPool {
+    let threads = cpu_list.len();
+    let cpu_list_for_handler = cpu_list.clone();
 
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .start_handler(move |thread_idx| {
+            let cpu = cpu_list_for_handler[thread_idx % cpu_list_for_handler.len()];
+            let _ = core_affinity::set_for_current(CoreId { id: cpu });
+        })
+        .build()
+        .expect("Failed to build Rayon pool");
+
+    PinnedPool { pool, threads }
+}
+
+fn build_option_b_pool_sets() -> PoolSets {
+    // 8 pools: split each NUMA node into 2 pools of 18
+    let mut pools_8 = Vec::with_capacity(8);
     for numa in 0..NUMA_NODES {
         let base = numa * CORES_PER_NUMA;
-
-        for p in 0..POOLS_PER_NUMA {
-            let start = base + p * THREADS_PER_PROOF;
-            let end = start + THREADS_PER_PROOF;
-            let cpu_list: Vec<usize> = (start..end).collect();
-
-            let cpu_list_for_handler = cpu_list.clone();
-
-            let pool = ThreadPoolBuilder::new()
-                .num_threads(cpu_list.len())
-                .start_handler(move |thread_idx| {
-                    let cpu = cpu_list_for_handler[thread_idx % cpu_list_for_handler.len()];
-                    let _ = core_affinity::set_for_current(CoreId { id: cpu });
-                })
-                .build()
-                .expect("Failed to build Rayon pool");
-
-            pools.push(PinnedPool { pool });
+        // 2 pools per NUMA node
+        for p in 0..2 {
+            let start = base + p * (CORES_PER_NUMA / 2); // 18
+            let end = start + (CORES_PER_NUMA / 2);
+            pools_8.push(build_pinned_pool((start..end).collect()));
         }
     }
+    assert_eq!(pools_8.len(), 8);
 
-    pools
+    // 4 pools: one per NUMA node, 36 threads each
+    let mut pools_4 = Vec::with_capacity(4);
+    for numa in 0..NUMA_NODES {
+        let base = numa * CORES_PER_NUMA;
+        pools_4.push(build_pinned_pool((base..(base + CORES_PER_NUMA)).collect()));
+    }
+    assert_eq!(pools_4.len(), 4);
+
+    // 2 pools: each spans 2 NUMA nodes (72 threads each)
+    let pools_2 = vec![
+        build_pinned_pool((0..(2 * CORES_PER_NUMA)).collect()),
+        build_pinned_pool(((2 * CORES_PER_NUMA)..TOTAL_CORES).collect()),
+    ];
+
+    // 1 pool: all cores
+    let pools_1 = vec![build_pinned_pool((0..TOTAL_CORES).collect())];
+
+    PoolSets {
+        pools_8,
+        pools_4,
+        pools_2,
+        pools_1,
+    }
 }
 
-/// Run N jobs with limited concurrency = pools.len().
-/// Each job runs inside a pinned Rayon pool via `pool.install(|| ...)`, so Halo2’s internal Rayon
-/// parallelism stays effective (and localized).
+/// Choose a pool set to keep ~all cores busy as the tree narrows.
+/// Uses largest power-of-two concurrency <= jobs, capped at 8.
+fn pick_pools<'a>(sets: &'a PoolSets, jobs: usize) -> &'a [PinnedPool] {
+    if jobs >= 8 {
+        &sets.pools_8
+    } else if jobs >= 4 {
+        &sets.pools_4
+    } else if jobs >= 2 {
+        &sets.pools_2
+    } else {
+        &sets.pools_1
+    }
+}
+
+/// Run N jobs with limited concurrency = min(pools.len(), N).
+/// Each job runs inside a pinned Rayon pool via `pool.install(|| ...)`,
+/// so Halo2’s internal Rayon parallelism stays effective (and localized).
 fn map_with_pools<T, E, FJob>(pools: &[PinnedPool], n: usize, job: FJob) -> Result<Vec<T>, E>
 where
     T: Send,
@@ -128,6 +172,8 @@ where
         return Ok(vec![]);
     }
 
+    let workers = std::cmp::min(n, pools.len());
+
     let (tx_job, rx_job) = channel::unbounded::<usize>();
     let (tx_res, rx_res) = channel::unbounded::<(usize, Result<T, E>)>();
 
@@ -137,7 +183,7 @@ where
     drop(tx_job);
 
     thread::scope(|scope| {
-        for pool in pools.iter() {
+        for pool in pools.iter().take(workers) {
             let rx_job = rx_job.clone();
             let tx_res = tx_res.clone();
             let pool_ref = &pool.pool;
@@ -445,7 +491,6 @@ impl Circuit<F> for AggCircuit {
 
         let (assigned_left_pi, assigned_right_pi) = if self.is_leaf {
             let neutral_scaling_factor = scalar_chip.assign_fixed(&mut layouter, false)?;
-
             AssignedAccumulator::scale_by_bit(
                 &mut layouter,
                 &scalar_chip,
@@ -458,10 +503,8 @@ impl Circuit<F> for AggCircuit {
                 &neutral_scaling_factor,
                 &mut right_acc,
             )?;
-
             left_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
             right_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
             (vec![left_state.clone()], vec![right_state.clone()])
         } else {
             let mut left_pi_vec = vec![left_state.clone()];
@@ -592,7 +635,6 @@ impl Circuit<F> for AggCircuit2 {
 
         let (assigned_left_pi, assigned_right_pi) = if self.is_leaf {
             let neutral_scaling_factor = scalar_chip.assign_fixed(&mut layouter, false)?;
-
             AssignedAccumulator::scale_by_bit(
                 &mut layouter,
                 &scalar_chip,
@@ -605,10 +647,8 @@ impl Circuit<F> for AggCircuit2 {
                 &neutral_scaling_factor,
                 &mut right_acc,
             )?;
-
             left_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
             right_acc.collapse(&mut layouter, &curve_chip, &scalar_chip)?;
-
             (vec![left_state.clone()], vec![right_state.clone()])
         } else {
             let mut left_pi_vec = vec![left_state.clone()];
@@ -838,13 +878,13 @@ impl AggKeyStore {
 }
 
 fn main() -> Result<(), std::io::Error> {
-    // Build NUMA-pinned pools once and reuse for all recursion layers.
-    let pools = build_option_b_pools();
-    println!(
-        "Option B enabled: {} pools × {} threads/proof",
-        pools.len(),
-        THREADS_PER_PROOF
-    );
+    // Build adaptive NUMA-pinned pools once and reuse.
+    let pool_sets = build_option_b_pool_sets();
+    println!("Option B (adaptive) enabled:");
+    println!("  8 pools × {} threads/proof", pool_sets.pools_8[0].threads);
+    println!("  4 pools × {} threads/proof", pool_sets.pools_4[0].threads);
+    println!("  2 pools × {} threads/proof", pool_sets.pools_2[0].threads);
+    println!("  1 pool  × {} threads/proof", pool_sets.pools_1[0].threads);
 
     // -----------------------------
     // Parameters / tree shape
@@ -1040,12 +1080,19 @@ fn main() -> Result<(), std::io::Error> {
     trivial_combined.collapse();
 
     // -----------------------------
-    // Generate Poseidon leaf proofs
+    // Generate Poseidon leaf proofs (NOW parallelized with adaptive pools)
     // -----------------------------
     println!("Creating {} POSEIDON leaf proofs...", num_leaves);
+    let poseidon_pools = pick_pools(&pool_sets, num_leaves);
+    println!(
+        "Poseidon stage: {} jobs, using {} pools × {} threads/proof",
+        num_leaves,
+        poseidon_pools.len(),
+        poseidon_pools[0].threads
+    );
 
-    let poseidon_proofs: Vec<(F, [F; 3], Vec<u8>)> = (0..num_leaves)
-        .map(|i| {
+    let poseidon_proofs: Vec<(F, [F; 3], Vec<u8>)> =
+        map_with_pools(poseidon_pools, num_leaves, |i| {
             use midnight_circuits::instructions::hash::HashCPU;
             use rand::SeedableRng;
             use rand_chacha::ChaCha8Rng;
@@ -1079,10 +1126,8 @@ fn main() -> Result<(), std::io::Error> {
                 transcript.finalize()
             };
 
-            println!("POSEIDON leaf {} created", i);
             Ok::<_, std::io::Error>((instance, witness, proof))
-        })
-        .collect::<Result<_, _>>()?;
+        })?;
 
     // -----------------------------
     // Create leaf aggregation layer (AGG level 1)
@@ -1093,8 +1138,16 @@ fn main() -> Result<(), std::io::Error> {
     let leaf_keys = agg_store.get(leaf_level)?;
     let leaf_agg_vk_name = leaf_keys.name.clone();
 
-    // Option B: replace outer par_iter with pool-limited execution
-    let mut current_level: Vec<TreeNode> = map_with_pools(&pools, num_leaves / 2, |i| {
+    let leaf_jobs = num_leaves / 2;
+    let leaf_pools = pick_pools(&pool_sets, leaf_jobs);
+    println!(
+        "Leaf AGG stage: {} jobs, using {} pools × {} threads/proof",
+        leaf_jobs,
+        leaf_pools.len(),
+        leaf_pools[0].threads
+    );
+
+    let mut current_level: Vec<TreeNode> = map_with_pools(leaf_pools, leaf_jobs, |i| {
         use midnight_circuits::instructions::hash::HashCPU;
 
         let (left_state, _, left_proof) = &poseidon_proofs[i * 2];
@@ -1162,7 +1215,6 @@ fn main() -> Result<(), std::io::Error> {
             .map_err(|e| io_other(format!("Leaf AGG proof failed for node {i}: {e:?}")))?;
             transcript.finalize()
         };
-
         println!(
             "Leaf AGG {} ({}) created in {:?}",
             i,
@@ -1201,18 +1253,22 @@ fn main() -> Result<(), std::io::Error> {
         let parent_keys = agg_store.get(parent_level)?;
         let parent_vk_name = parent_keys.name.clone();
 
+        let jobs = current_level.len() / 2;
+        let pools = pick_pools(&pool_sets, jobs);
         println!(
-            "\nBuilding AGG level {} ({}) with {} nodes...",
+            "\nBuilding AGG level {} ({}) with {} nodes... using {} pools × {} threads/proof",
             parent_level,
             parent_vk_name,
-            current_level.len() / 2
+            jobs,
+            pools.len(),
+            pools[0].threads
         );
 
         let child_keys = agg_store.get(child_level)?;
         let child_vk_data = child_keys.vk_data.clone();
         let child_vk_name = child_keys.name.clone();
 
-        let next_level: Vec<TreeNode> = map_with_pools(&pools, current_level.len() / 2, |i| {
+        let next_level: Vec<TreeNode> = map_with_pools(pools, jobs, |i| {
             use midnight_circuits::instructions::hash::HashCPU;
 
             let left = &current_level[i * 2];
@@ -1270,7 +1326,6 @@ fn main() -> Result<(), std::io::Error> {
                 })?;
                 transcript.finalize()
             };
-
             println!(
                 "Level {} node {} ({}) created in {:?}",
                 parent_level,
